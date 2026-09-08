@@ -1,0 +1,19 @@
+# Python / backend
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node / frontend
+node_modules/
+dist/
+.env
+
+# PlatformIO / firmware
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Editores
+.vscode/
+.idea/

@@ -1,0 +1,512 @@
+/* ==========================================================================
+ *  Painel do torrador - direcao visual "caderno de torra"
+ *
+ *  A referencia e a folha de anotacao que o torrador preenche a mao durante
+ *  a torra: papel, tinta, linhas finas. Nada de card com sombra.
+ *
+ *  REGRA TIPOGRAFICA DO SISTEMA (vale para a tela inteira):
+ *      serifada (Fraunces) = VALORES MEDIDOS  -> temperatura, potencia, motor
+ *      sans     (Inter)    = INTERFACE        -> rotulos, botoes, eixos, avisos
+ *  Numero medido nunca aparece em sans; botao ou rotulo nunca em serifada.
+ *
+ *  REGRA DE COR:
+ *      O terracota e a UNICA cor de destaque e aparece em exatamente tres
+ *      lugares: a temperatura atual, o estado "ligado" e a linha do grafico.
+ *      Vermelho e oliva sao semanticos (falha / tudo certo), nao decoracao.
+ *
+ *  LAYOUT (painel, nao documento):
+ *      O alvo e a apresentacao ao vivo em notebook: a tela inteira cabe em
+ *      uma viewport, sem rolagem. Grid de altura fixa (100dvh):
+ *
+ *          +-------------------------------------------------+
+ *          | cabecalho: titulo + backend                     | auto
+ *          +------------------+------------------------------+
+ *          | coluna de leitura|  grafico (cresce nos dois    |
+ *          |  status          |  eixos para ocupar a sobra)  | 1fr
+ *          |  temperatura     |                              |
+ *          |  campos          |                              |
+ *          |  --------------  |                              |
+ *          |  comandos (base) |                              |
+ *          +------------------+------------------------------+
+ *              minmax(340px, 30rem)          1fr
+ *
+ *      Abaixo de 900px o grid vira uma coluna so e a pagina volta a rolar.
+ * ========================================================================== */
+
+:root {
+  color-scheme: light;
+
+  /* superficie */
+  --mesa: #f4efe7;          /* fundo atras do painel */
+  --papel: #fcf9f4;         /* a folha */
+  --linha: #e7e0d5;         /* hairline padrao */
+  --linha-forte: #d8cec0;   /* hairline de contorno de controle */
+
+  /* tinta (contraste verificado sobre --papel) */
+  --ink: #2e2621;           /* 14,1:1 */
+  --ink-suave: #6e6259;     /*  5,6:1 - rotulos e texto de apoio */
+
+  /* destaque unico */
+  --terracota: #a9502f;     /*  5,2:1 */
+  --terracota-tenue: rgba(169, 80, 47, 0.1);
+
+  /* semanticas */
+  --oliva: #4f5b3c;         /*  6,9:1 - cadeia completa */
+  --oxblood: #8a2e22;       /*  8,0:1 - backend fora do ar */
+
+  --serif: "Fraunces", Georgia, "Times New Roman", serif;
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  --e1: 4px;
+  --e2: 8px;
+  --e3: 14px;
+  --e4: 22px;
+  --e5: 34px;
+  --e6: 52px;
+
+  /* respiro interno dos blocos do painel */
+  --folga: clamp(20px, 2.2vw, 34px);
+
+  --saida: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--mesa);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ==========================================================================
+ *  Estrutura do painel
+ * ========================================================================== */
+.painel {
+  height: 100dvh;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  background: var(--papel);
+  overflow: hidden;
+}
+
+.cabecalho {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--e2) var(--e4);
+  padding: var(--e3) var(--folga);
+  border-bottom: 1px solid var(--linha);
+}
+
+.corpo {
+  display: grid;
+  grid-template-columns: minmax(340px, 30rem) 1fr;
+  min-height: 0; /* deixa as duas colunas encolherem dentro do grid */
+}
+
+.coluna-leitura {
+  display: flex;
+  flex-direction: column;
+  padding: var(--folga);
+  border-right: 1px solid var(--linha);
+  min-height: 0;
+  overflow-y: auto; /* so entra em acao em notebooks de tela muito baixa */
+  /* O que sobra de altura vira respiro DISTRIBUIDO entre os blocos, em vez
+     de um buraco unico no meio da coluna. */
+  justify-content: space-between;
+  gap: var(--e4);
+}
+
+.area-grafico {
+  display: flex;
+  flex-direction: column;
+  padding: var(--folga);
+  min-width: 0;  /* sem isto o grafico empurra a coluna e estoura o grid */
+  min-height: 0;
+}
+
+/* Os comandos ficam ancorados na base da coluna. O respiro que sobra entre
+   os numeros e os controles e proposital: separa "o que esta acontecendo"
+   de "o que eu posso fazer", e mantem os botoes sempre no mesmo lugar da
+   tela durante a torra. */
+.comandos {
+  padding-top: var(--e4);
+  border-top: 1px solid var(--linha);
+}
+
+/* ==========================================================================
+ *  Cabecalho
+ * ========================================================================== */
+.titulo {
+  margin: 0;
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: clamp(1.35rem, 1.8vw, 1.7rem);
+  font-variation-settings: "opsz" 80;
+  letter-spacing: -0.018em;
+}
+
+.subtitulo {
+  margin: 0;
+  color: var(--ink-suave);
+  font-size: 0.8125rem;
+}
+
+.subtitulo code {
+  font-family: var(--sans);
+  color: var(--ink);
+}
+
+/* ==========================================================================
+ *  Status da cadeia
+ * ========================================================================== */
+.status {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0 0 var(--e5);
+  font-size: 0.9375rem;
+  color: var(--ink);
+}
+
+/* A cor semantica fica so no ponto: o terracota e reservado a leitura, ao
+   motor ligado e a linha do grafico. Estado nunca compete com valor. */
+.status--ok .ponto      { color: var(--oliva); }
+.status--offline .ponto { color: var(--oxblood); }
+.status--morto .ponto   { color: var(--oxblood); }
+
+.status b { font-weight: 500; }
+
+.status-detalhe {
+  display: block;
+  color: var(--ink-suave);
+  font-weight: 400;
+  font-size: 0.875rem;
+}
+
+.ponto {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  transform: translateY(-1px);
+}
+.status--offline .ponto { animation: pulso 1.8s ease-in-out infinite; }
+
+@keyframes pulso {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.28; }
+}
+
+/* ==========================================================================
+ *  Leitura principal
+ * ========================================================================== */
+.rotulo {
+  display: block;
+  font-size: 0.8125rem;
+  color: var(--ink-suave);
+}
+
+.termometro { margin-top: var(--e2); }
+
+.valor-grande {
+  display: flex;
+  align-items: baseline;
+  gap: 0.16em;
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: clamp(3.6rem, 6vw, 7rem);
+  font-variation-settings: "opsz" 144;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.032em;
+  line-height: 1;
+  color: var(--terracota);
+}
+
+.valor-grande .unidade {
+  font-size: 0.32em;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--ink-suave);
+}
+
+.valor-grande.vazio { color: var(--linha-forte); }
+
+/* Placa fora do ar: o numero na tela e o ultimo valor recebido, nao uma
+   leitura ao vivo. Ele perde o destaque para nao mentir sobre isso. */
+.valor-grande.parado { color: var(--ink-suave); }
+.regua.parada i { background: var(--linha-forte); }
+
+.regua {
+  height: 2px;
+  margin-top: var(--e3);
+  background: var(--linha);
+  overflow: hidden;
+}
+.regua i {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--terracota);
+  transform-origin: left center;
+  /* scaleX em vez de width: transform nao dispara layout a cada leitura */
+  transition: transform 900ms var(--saida);
+}
+
+/* --- Agtron estimado: segundo valor de destaque, um degrau abaixo do hero -
+   Em tinta, nao em terracota: o destaque colorido continua reservado a
+   temperatura, ao motor ligado e a linha do grafico. */
+.valor-medio {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4em;
+  margin-top: var(--e2);
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: clamp(2.25rem, 2.8vw, 3rem);
+  font-variation-settings: "opsz" 72;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.022em;
+  line-height: 1;
+  color: var(--ink);
+}
+.valor-medio.parado,
+.valor-medio.vazio { color: var(--ink-suave); }
+.valor-medio.vazio { color: var(--linha-forte); }
+
+.valor-medio .faixa {
+  font-family: var(--sans);
+  font-size: 0.3em;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--ink-suave);
+}
+
+.aviso-estimativa {
+  margin: var(--e2) 0 0;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--ink-suave);
+}
+
+/* --- campos secundarios: tres colunas dentro da coluna de leitura ------- */
+.campos {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--e3);
+  margin-top: var(--e5);
+}
+
+.campo-valor {
+  margin-top: 2px;
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 1.375rem;
+  font-variation-settings: "opsz" 40;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.campo-valor .sufixo {
+  font-size: 0.68em;
+  color: var(--ink-suave);
+}
+.campo-valor.ligado { color: var(--terracota); }
+.campo-valor.vazio { color: var(--linha-forte); }
+
+/* ==========================================================================
+ *  Grafico
+ * ========================================================================== */
+.secao-titulo {
+  margin: 0 0 var(--e3);
+  font-family: var(--serif);
+  font-weight: 500;
+  font-size: 1.0625rem;
+  font-variation-settings: "opsz" 30;
+  letter-spacing: -0.005em;
+}
+
+/* cresce nos dois eixos: e ele que consome a sobra da tela */
+.grafico {
+  flex: 1;
+  min-height: 220px;
+  margin-left: -8px; /* alinha o zero do eixo com a margem do texto */
+}
+
+.grafico-vazio {
+  flex: 1;
+  min-height: 220px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-top: 1px solid var(--linha);
+  border-bottom: 1px solid var(--linha);
+  color: var(--ink-suave);
+  font-size: 0.875rem;
+  text-align: center;
+}
+
+.dica {
+  background: var(--ink);
+  color: var(--papel);
+  padding: 7px 11px;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+.dica .dica-temp {
+  font-family: var(--serif);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+ *  Comandos
+ * ========================================================================== */
+.linha-comando {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--e2) var(--e3);
+}
+.linha-comando + .linha-comando { margin-top: var(--e3); }
+
+.linha-comando > .rotulo {
+  width: 62px;
+  flex: none;
+}
+
+.deslizante {
+  flex: 1 1 120px;
+  min-width: 0;
+  accent-color: var(--terracota);
+  height: 22px;
+  cursor: pointer;
+}
+.deslizante:disabled { cursor: not-allowed; opacity: 0.45; }
+
+.entrada {
+  width: 66px;
+  flex: none;
+  padding: 7px 9px;
+  font-family: var(--sans);
+  font-size: 0.9375rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  background: var(--papel);
+  border: 1px solid var(--linha-forte);
+  border-radius: 2px;
+  transition: border-color 160ms var(--saida);
+}
+.entrada:hover:not(:disabled) { border-color: var(--ink-suave); }
+.entrada:focus-visible {
+  outline: 2px solid var(--terracota);
+  outline-offset: 1px;
+  border-color: var(--terracota);
+}
+.entrada:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.botao {
+  padding: 7px 15px;
+  font-family: var(--sans);
+  font-size: 0.9375rem;
+  font-weight: 500;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--linha-forte);
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background-color 160ms var(--saida), border-color 160ms var(--saida);
+}
+.botao:hover:not(:disabled) { background: var(--terracota-tenue); border-color: var(--terracota); }
+.botao:active:not(:disabled) { background: rgba(169, 80, 47, 0.18); }
+.botao:focus-visible { outline: 2px solid var(--terracota); outline-offset: 2px; }
+.botao:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.botao--forte {
+  color: var(--papel);
+  background: var(--ink);
+  border-color: var(--ink);
+}
+.botao--forte:hover:not(:disabled) { background: #453a32; border-color: #453a32; }
+.botao--forte:active:not(:disabled) { background: #241e1a; }
+
+.retorno {
+  margin: var(--e3) 0 0;
+  min-height: 1.4em;
+  font-size: 0.8125rem;
+  color: var(--ink-suave);
+}
+.retorno.falhou { color: var(--oxblood); }
+
+.nota {
+  margin: var(--e2) 0 0;
+  font-size: 0.8125rem;
+  color: var(--ink-suave);
+}
+
+/* ==========================================================================
+ *  Notebook de tela baixa (1366x768 e parecidos)
+ *
+ *  O painel precisa caber INTEIRO na viewport no dia da apresentacao. Aqui a
+ *  regra e por ALTURA, nao por largura: encolhe o respiro e o numero hero o
+ *  suficiente para os comandos nao cairem para fora da tela. Em monitor alto
+ *  nada disso se aplica e o hero volta ao tamanho cheio.
+ * ========================================================================== */
+@media (min-width: 901px) and (max-height: 880px) {
+  :root { --folga: 20px; }
+
+  .valor-grande { font-size: clamp(3rem, 5vw, 5.5rem); }
+  .valor-medio { font-size: clamp(1.9rem, 2.4vw, 2.4rem); }
+  .status { margin-bottom: var(--e4); }
+  .campos { margin-top: var(--e4); }
+  .termometro { margin-top: var(--e1); }
+  .regua { margin-top: var(--e2); }
+  .comandos { padding-top: var(--e3); }
+  .secao-titulo { margin-bottom: var(--e2); }
+  .cabecalho { padding-top: var(--e2); padding-bottom: var(--e2); }
+}
+
+/* ==========================================================================
+ *  Telas menores: o painel deixa de ser painel e volta a rolar
+ * ========================================================================== */
+@media (max-width: 900px) {
+  .painel {
+    height: auto;
+    min-height: 100dvh;
+    overflow: visible;
+  }
+  .corpo {
+    grid-template-columns: 1fr;
+  }
+  .coluna-leitura {
+    border-right: 0;
+    border-bottom: 1px solid var(--linha);
+    overflow-y: visible;
+  }
+  .comandos { margin-top: var(--e5); }
+  .grafico,
+  .grafico-vazio { min-height: 300px; }
+}
+
+@media (max-width: 480px) {
+  .campos { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .linha-comando > .rotulo { width: 100%; }
+}
+
+/* ==========================================================================
+ *  Respeito a preferencia de menos movimento
+ * ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
