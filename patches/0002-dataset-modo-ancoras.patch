@@ -1,0 +1,180 @@
+diff --git a/gerar_dataset_interpolado.py b/gerar_dataset_interpolado.py
+index fb5e9177..7f9d8f9e 100644
+--- a/gerar_dataset_interpolado.py
++++ b/gerar_dataset_interpolado.py
+@@ -93,7 +93,39 @@ def interpolar_agtron(timestamp, ancoras):
+     return ancoras[-1][1]
+ 
+ 
+-def interpolar_video(caminho, origem_video):
++JANELA_ANCORA_PADRAO = 2.0  # segundos para cada lado da marcacao
++
++
++def selecionar_por_ancora(linhas, ancoras, janela):
++    """Modo 'ancoras': NAO inventa rotulo nenhum.
++
++    Devolve so os frames que caem dentro de +-janela segundos de uma marcacao
++    manual, rotulados com o Agtron daquela marcacao. Frames longe de qualquer
++    ancora sao descartados em vez de receberem um valor interpolado.
++
++    Por que isto existe: a interpolacao linear assume que o grao escurece em
++    linha reta no tempo entre duas marcacoes, o que nao acontece -- o
++    escurecimento acelera. Com 2 ancoras, um CSV de 5000 linhas interpoladas
++    nao carrega 5000 observacoes; carrega 2 observacoes e muito preenchimento,
++    e um R^2 alto contra esses alvos mede o quao bem a cor reproduz a reta
++    inventada, nao a torra.
++
++    NOTA: nao ha aqui um modo com curva exponencial de proposito. Trocar a reta
++    por uma curva escolhida a dedo substituiria um chute por outro chute de
++    aparencia mais sofisticada. Enquanto nao houver Agtron medido, o unico
++    caminho honesto e treinar so onde existe observacao.
++    """
++    saida = []
++    for linha in linhas:
++        t = float(linha['timestamp'])
++        for ts, agtron, _fase in ancoras:
++            if abs(t - ts) <= janela:
++                saida.append((linha, agtron))
++                break
++    return saida
++
++
++def interpolar_video(caminho, origem_video, modo, janela):
+     """Le um dataset_real*.csv de UM video, identifica suas proprias ancoras
+     e retorna as linhas interpoladas ja marcadas com a coluna origem_video.
+     Retorna lista vazia (com aviso) se o video nao tiver nenhuma fase marcada."""
+@@ -108,31 +140,45 @@ def interpolar_video(caminho, origem_video):
+     for ts, agtron, fase in ancoras:
+         print(f"  {fase:<7} t={ts:.3f}s -> Agtron={agtron:.1f}")
+ 
+-    linhas_saida = []
+-    for linha in linhas:
+-        timestamp = float(linha['timestamp'])
+-        agtron_estimado = interpolar_agtron(timestamp, ancoras)
+-        linhas_saida.append({
+-            'frame': linha['frame'],
+-            'timestamp': linha['timestamp'],
+-            'L': linha['L'],
+-            'a': linha['a'],
+-            'b': linha['b'],
+-            'agtron_interpolado': round(agtron_estimado, 3),
+-            'origem_video': origem_video,
+-        })
+-
+-    return linhas_saida
+-
+-
+-def gerar_dataset_interpolado(caminhos_entrada, caminho_saida):
++    if modo == 'ancoras':
++        pares = selecionar_por_ancora(linhas, ancoras, janela)
++        print(f"  modo 'ancoras': {len(pares)} de {len(linhas)} frames ficaram "
++              f"(janela de +-{janela:g}s em volta de cada marcacao)")
++    else:
++        pares = [(linha, interpolar_agtron(float(linha['timestamp']), ancoras))
++                 for linha in linhas]
++        print(f"  modo 'linear': {len(pares)} frames, com rotulo interpolado")
++
++    return [{
++        'frame': linha['frame'],
++        'timestamp': linha['timestamp'],
++        'L': linha['L'],
++        'a': linha['a'],
++        'b': linha['b'],
++        'agtron_interpolado': round(agtron, 3),
++        'origem_video': origem_video,
++        'modo': modo,
++    } for linha, agtron in pares]
++
++
++def gerar_dataset_interpolado(caminhos_entrada, caminho_saida, modo, janela):
+     print("=" * 70)
+-    print("ATENCAO: os valores 'agtron_interpolado' gerados abaixo sao ESTIMATIVAS")
+-    print("por interpolacao temporal linear entre as poucas marcacoes manuais de")
+-    print("fase (1=Cru, 2=Clara, 3=Media, 4=Escura). NAO sao medicoes reais de")
+-    print("Agtron (nao houve cartela de referencia nem colorimetro fisico).")
+-    print("Assume-se escurecimento aproximadamente linear no tempo entre marcacoes.")
+-    print("Cada video em --inputs e interpolado SEPARADAMENTE com suas proprias")
++    if modo == 'ancoras':
++        print("MODO 'ancoras': so entram frames proximos de uma marcacao manual,")
++        print("rotulados com o Agtron daquela marcacao. Nenhum rotulo e inventado")
++        print("entre marcacoes -- o dataset fica menor e mais honesto.")
++        print("Os valores continuam NAO sendo medicoes reais de Agtron: vem da")
++        print("convencao Cru=95 / Clara=75 / Media=55 / Escura=35 aplicada a um")
++        print("julgamento visual. So uma cartela de referencia ou um colorimetro")
++        print("resolve isso de verdade.")
++    else:
++        print("MODO 'linear': os valores 'agtron_interpolado' sao ESTIMATIVAS por")
++        print("interpolacao temporal linear entre as poucas marcacoes manuais de")
++        print("fase. Assume-se escurecimento linear no tempo, o que NAO acontece:")
++        print("o escurecimento acelera. Com poucas ancoras, a maior parte das")
++        print("linhas geradas e preenchimento, nao observacao. Prefira --modo")
++        print("ancoras, e use este modo so para reproduzir resultados antigos.")
++    print("Cada video em --inputs e tratado SEPARADAMENTE com suas proprias")
+     print("ancoras de tempo (timestamps nao sao comparaveis entre videos).")
+     print("=" * 70)
+ 
+@@ -142,14 +188,17 @@ def gerar_dataset_interpolado(caminhos_entrada, caminho_saida):
+             print(f"Erro: '{caminho}' nao encontrado nesta pasta. Pulando.")
+             continue
+         origem_video = f'v{indice}'
+-        linhas_finais.extend(interpolar_video(caminho, origem_video))
++        linhas_finais.extend(interpolar_video(caminho, origem_video, modo, janela))
+ 
+     if not linhas_finais:
+         print("Erro: nenhum video produziu linhas interpoladas. Nada a salvar.")
+         return
+ 
+     with open(caminho_saida, 'w', newline='', encoding='utf-8') as arquivo_csv:
+-        campos = ['frame', 'timestamp', 'L', 'a', 'b', 'agtron_interpolado', 'origem_video']
++        # 'modo' na saida para que um CSV antigo nunca seja confundido com um
++        # novo: sem essa coluna nao da para saber como os rotulos foram obtidos.
++        campos = ['frame', 'timestamp', 'L', 'a', 'b', 'agtron_interpolado',
++                  'origem_video', 'modo']
+         escritor = csv.DictWriter(arquivo_csv, fieldnames=campos)
+         escritor.writeheader()
+         escritor.writerows(linhas_finais)
+@@ -159,6 +208,11 @@ def gerar_dataset_interpolado(caminhos_entrada, caminho_saida):
+         n = sum(1 for linha in linhas_finais if linha['origem_video'] == origem)
+         print(f"  {origem}: {n} frames")
+     print("Lembre-se: use estes valores como estimativas, nao como ground truth real.")
++    if modo == 'ancoras':
++        n_unicos = len({linha['agtron_interpolado'] for linha in linhas_finais})
++        print(f"Rotulos distintos no dataset: {n_unicos}. Este e o numero de")
++        print("observacoes independentes que voce realmente tem -- e o teto do que")
++        print("da para afirmar sobre a precisao do modelo.")
+ 
+ 
+ if __name__ == '__main__':
+@@ -179,10 +233,31 @@ if __name__ == '__main__':
+             "origem_video, conforme a ordem informada. Padrao: dataset_real.csv."
+         ),
+     )
++    parser.add_argument(
++        '--modo',
++        required=True,
++        choices=['ancoras', 'linear'],
++        help=(
++            "'ancoras': so frames perto de uma marcacao manual, sem rotulo "
++            "inventado (recomendado). 'linear': comportamento antigo, "
++            "interpolando entre marcacoes -- mantido so para reproduzir "
++            "resultados anteriores. Obrigatorio de proposito: a escolha muda o "
++            "significado do dataset e nao deveria ter um padrao silencioso."
++        ),
++    )
++    parser.add_argument(
++        '--janela',
++        type=float,
++        default=JANELA_ANCORA_PADRAO,
++        help=(
++            f'Segundos para cada lado da marcacao no modo ancoras '
++            f'(padrao: {JANELA_ANCORA_PADRAO:g}).'
++        ),
++    )
+     parser.add_argument(
+         '--saida',
+         default=CSV_SAIDA,
+         help=f'Caminho do CSV combinado de saida (padrao: {CSV_SAIDA}).',
+     )
+     args = parser.parse_args()
+-    gerar_dataset_interpolado(args.inputs, args.saida)
++    gerar_dataset_interpolado(args.inputs, args.saida, args.modo, args.janela)
