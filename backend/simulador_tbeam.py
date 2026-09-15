@@ -33,6 +33,10 @@ TEMP_AMBIENTE = 25.0
 TEMP_MAX_TORRA = 215.0
 FATOR_APROXIMACAO = 0.05
 INTERVALO_ENVIO_S = 1.0
+# Espelha INTERVALO_AMOSTRAGEM_MS do firmware: o sensor e lido 4x entre dois
+# envios e o que vai para a rede e a media. O protocolo nao muda - continua
+# saindo uma mensagem por segundo.
+INTERVALO_AMOSTRAGEM_S = 0.25
 
 # Mesmo estado que o firmware mantem em memoria.
 temperatura = TEMP_AMBIENTE
@@ -41,25 +45,42 @@ motor_ligado = False
 boot = time.monotonic()
 
 
+# Fator POR AMOSTRA, derivado do fator por segundo - mesma conta que o
+# firmware faz com powf(). Mantem a curva identica a qualquer taxa.
+FATOR_POR_AMOSTRA = 1.0 - (1.0 - FATOR_APROXIMACAO) ** INTERVALO_AMOSTRAGEM_S
+
+
 def ler_temperatura() -> float:
-    """Espelho da funcao lerTemperatura() do firmware."""
+    """Espelho da funcao lerTemperatura() do firmware. Uma amostra crua."""
     global temperatura
     alvo = TEMP_AMBIENTE + (TEMP_MAX_TORRA - TEMP_AMBIENTE) * (potencia_atual / 100.0)
-    temperatura += (alvo - temperatura) * FATOR_APROXIMACAO
-    temperatura += random.uniform(-0.15, 0.15)
-    return temperatura
+    temperatura += (alvo - temperatura) * FATOR_POR_AMOSTRA
+    # Ruido de MEDICAO: fora do estado, para que a media consiga atenua-lo.
+    return temperatura + random.uniform(-0.15, 0.15)
+
+
+async def temperatura_media() -> float:
+    """Colhe as amostras de um ciclo de envio e devolve a media."""
+    n = max(1, int(round(INTERVALO_ENVIO_S / INTERVALO_AMOSTRAGEM_S)))
+    soma = 0.0
+    for _ in range(n):
+        soma += ler_temperatura()
+        await asyncio.sleep(INTERVALO_AMOSTRAGEM_S)
+    return soma / n
 
 
 async def transmitir(conexao) -> None:
     while True:
+        # A espera do ciclo acontece dentro de temperatura_media(), que dorme
+        # INTERVALO_AMOSTRAGEM_S entre cada amostra.
+        media = await temperatura_media()
         leitura = {
-            "temp": round(ler_temperatura(), 2),
+            "temp": round(media, 2),
             "timestamp": int((time.monotonic() - boot) * 1000),  # millis()
             "potencia_atual": potencia_atual,
             "motor_ligado": motor_ligado,
         }
         await conexao.send(json.dumps(leitura))
-        await asyncio.sleep(INTERVALO_ENVIO_S)
 
 
 async def atender(conexao) -> None:

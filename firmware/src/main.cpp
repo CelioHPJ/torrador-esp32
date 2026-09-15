@@ -56,6 +56,13 @@ const uint16_t PORTA_HTTP        = 80;     // servidor HTTP + WebSocket
 const char    *CAMINHO_WEBSOCKET = "/ws";  // ws://<ip-do-tbeam>/ws
 const uint32_t INTERVALO_ENVIO_MS = 1000;  // periodo de transmissao (1 s)
 
+// Superamostragem: o sensor e lido varias vezes entre dois envios e o que vai
+// para a rede e a MEDIA das amostras. Reduz o ruido de leitura por um fator de
+// raiz(N) - 4 amostras derrubam o ruido pela metade - sem aumentar o trafego,
+// o tamanho da serie no grafico nem o custo de render do frontend.
+// 250 ms respeita com folga o tempo de conversao do MAX31855 (~100 ms).
+const uint32_t INTERVALO_AMOSTRAGEM_MS = 250;   // 4 amostras por envio
+
 /* ------------------------------------------------------------------------ */
 /*  ESTADO DA TORRA (o "modelo" que a placa mantem em memoria)               */
 /* ------------------------------------------------------------------------ */
@@ -67,7 +74,8 @@ bool motorLigado   = false;  // desligado ate alguem mandar {"motor":"on"}
 AsyncWebServer servidor(PORTA_HTTP);
 AsyncWebSocket ws(CAMINHO_WEBSOCKET);
 
-uint32_t ultimoEnvio = 0;
+uint32_t ultimoEnvio   = 0;
+uint32_t ultimaAmostra = 0;
 
 /* ==========================================================================
  *  #############   ATENCAO - PONTO DE TROCA DO SENSOR   ####################
@@ -114,11 +122,18 @@ uint32_t ultimoEnvio = 0;
  *           temperaturaAtual = (float) c;
  *           return temperaturaAtual;
  *
+ *       OBS: esta funcao agora e chamada a cada INTERVALO_AMOSTRAGEM_MS
+ *       (250 ms) e o que vai para a rede e a MEDIA das amostras do segundo
+ *       - ver amostrarTemperatura() / temperaturaMedia() mais abaixo. Nao ha
+ *       nada a fazer para isso funcionar: basta a funcao devolver UMA leitura
+ *       crua por chamada. O tratamento de isnan acima ja evita que uma falha
+ *       de leitura envenene a media.
+ *
  *  ---------------------------------------------------------------------
  *  COMO A SIMULACAO ATUAL FUNCIONA:
  *
  *  Aproximacao assintotica (resfriamento/aquecimento de Newton simplificado),
- *  chamada uma vez por ciclo de transmissao:
+ *  chamada uma vez por AMOSTRA (4x por ciclo de transmissao):
  *
  *      temperatura += (alvo - temperatura) * FATOR_APROXIMACAO;
  *
@@ -132,7 +147,16 @@ float lerTemperatura()
 {
     const float TEMP_AMBIENTE      = 25.0f;   // ponto de partida
     const float TEMP_MAX_TORRA     = 215.0f;  // patamar com potencia 100%
-    const float FATOR_APROXIMACAO  = 0.05f;   // ~20 s de constante de tempo
+
+    // Esta funcao passou a ser chamada a cada INTERVALO_AMOSTRAGEM_MS, e nao
+    // mais uma vez por segundo - entao o fator precisa ser POR AMOSTRA, senao
+    // a curva simulada subiria 4x mais rapido. Derivado do fator por segundo
+    // (0.05 -> ~20 s de constante de tempo):
+    //     f_amostra = 1 - (1 - f_segundo) ^ (intervalo_amostra / 1 s)
+    // Assim o formato da curva fica identico a qualquer taxa de amostragem e
+    // continua batendo com o simulador em backend/simulador_tbeam.py.
+    static const float FATOR_APROXIMACAO =
+        1.0f - powf(1.0f - 0.05f, INTERVALO_AMOSTRAGEM_MS / 1000.0f);
 
     static float temperaturaAtual = TEMP_AMBIENTE;
 
@@ -142,10 +166,12 @@ float lerTemperatura()
 
     temperaturaAtual += (alvo - temperaturaAtual) * FATOR_APROXIMACAO;
 
-    // Ruidinho de +-0.15 C so para a curva nao parecer sintetica demais.
-    temperaturaAtual += (random(-15, 16) / 100.0f);
-
-    return temperaturaAtual;
+    // Ruido de MEDICAO: +-0.15 C aplicado apenas ao valor RETORNADO, nunca
+    // acumulado em temperaturaAtual. A distincao importa agora que existe
+    // superamostragem: somado ao estado o ruido viraria um passeio aleatorio
+    // (deriva permanente, que media nenhuma remove); fora do estado ele e
+    // exatamente o tipo de ruido que a media das amostras atenua.
+    return temperaturaAtual + (random(-15, 16) / 100.0f);
 }
 /* ======================  FIM DO PONTO DE TROCA  ========================== */
 
@@ -184,12 +210,38 @@ bool tratarPayloadComando(const uint8_t *dados, size_t tamanho)
 }
 
 /* ------------------------------------------------------------------------ */
+/*  SUPERAMOSTRAGEM                                                          */
+/* ------------------------------------------------------------------------ */
+// Acumulador das amostras colhidas entre dois envios.
+double   somaAmostras = 0.0;
+uint16_t qtdAmostras  = 0;
+
+// Chamada pelo loop() a cada INTERVALO_AMOSTRAGEM_MS. So acumula, nao envia.
+void amostrarTemperatura()
+{
+    somaAmostras += lerTemperatura();
+    qtdAmostras++;
+}
+
+// Media das amostras desde o ultimo envio; zera o acumulador para o proximo.
+float temperaturaMedia()
+{
+    if (qtdAmostras == 0) {       // nenhuma amostra no intervalo: le direto
+        return lerTemperatura();
+    }
+    float media  = (float) (somaAmostras / qtdAmostras);
+    somaAmostras = 0.0;
+    qtdAmostras  = 0;
+    return media;
+}
+
+/* ------------------------------------------------------------------------ */
 /*  TRANSMISSAO                                                              */
 /* ------------------------------------------------------------------------ */
 void transmitirLeitura()
 {
     JsonDocument leitura;
-    leitura["temp"]           = lerTemperatura();   // <- ponto de troca
+    leitura["temp"]           = temperaturaMedia();  // media das amostras
     leitura["timestamp"]      = millis();
     leitura["potencia_atual"] = potenciaAtual;
     leitura["motor_ligado"]   = motorLigado;
@@ -311,6 +363,14 @@ void loop()
     }
 
     uint32_t agora = millis();
+
+    // Amostragem rapida: colhe e acumula, sem mandar nada para a rede.
+    if (agora - ultimaAmostra >= INTERVALO_AMOSTRAGEM_MS) {
+        ultimaAmostra = agora;
+        amostrarTemperatura();
+    }
+
+    // Envio: manda a MEDIA das amostras colhidas desde o envio anterior.
     if (agora - ultimoEnvio >= INTERVALO_ENVIO_MS) {
         ultimoEnvio = agora;
         transmitirLeitura();
