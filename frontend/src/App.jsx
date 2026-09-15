@@ -101,6 +101,15 @@ export default function App() {
         }
 
         setOffline(Boolean(msg.offline))
+
+        // Tick de conexao: o backend manda isto enquanto o T-Beam esta fora
+        // (e no instante em que ele volta) so para manter o estado da tela em
+        // dia. Nao ha leitura nova num tick - sair agora e o que impede a
+        // curva de ganhar pontos repetidos e o contador de leituras de subir
+        // sozinho durante uma queda. A ultima temperatura recebida continua
+        // na tela: ela esta em "leitura", que nao e tocado aqui.
+        if (msg.tipo === 'tick') return
+
         if (msg.temp != null) setLeitura(msg)
         if (msg.potencia_atual != null && !usuarioMexeuRef.current) {
           setPotencia(msg.potencia_atual)

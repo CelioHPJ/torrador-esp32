@@ -15,8 +15,17 @@
    4. Receber POST /comando do frontend e repassar para o T-Beam.
    5. Nunca travar nem cair se o T-Beam sumir: marca "offline": true nas
       mensagens enviadas ao frontend e segue tentando reconectar em background.
+   6. Zerar a sessao sob demanda (POST /sessao/nova), sem reiniciar o processo.
 
  O frontend NUNCA fala direto com o T-Beam - so com este backend.
+
+ DUAS FORMAS DE MENSAGEM saem daqui, separadas pelo campo "tipo":
+   "leitura" - uma leitura nova do T-Beam. Tem "temp" e "recebido_em", e e
+               isto (e so isto) que o frontend plota no grafico.
+   "tick"    - aviso de estado da conexao, SEM leitura nenhuma. Enquanto a
+               placa esta fora, e o tick que mantem a flag "offline" viva na
+               tela; como ele nao carrega "temp" nem "recebido_em", o frontend
+               nao o confunde com dado novo nem conta um ponto a mais.
 
  Configuracao por variavel de ambiente (todas opcionais):
    TBEAM_HOST     IP do T-Beam na rede        (padrao: 192.168.0.50)
@@ -48,6 +57,24 @@ TBEAM_WS_PATH = os.getenv("TBEAM_WS_PATH", "/ws")
 TBEAM_URI = f"ws://{TBEAM_HOST}:{TBEAM_PORT}{TBEAM_WS_PATH}"
 
 INTERVALO_RECONEXAO_S = 3.0   # espera entre tentativas de reconexao
+
+# Vigia de dado parado. O T-Beam manda 1 leitura por segundo, entao 5 s de
+# silencio sao cinco leituras perdidas em sequencia: isso e queda, nao atraso.
+# Este vigia e INDEPENDENTE do ping/pong do WebSocket - o ping so denuncia um
+# socket que morreu calado depois de ping_interval + ping_timeout (ate ~40 s),
+# e ate la a tela mostraria a ultima temperatura como se estivesse tudo bem.
+LIMITE_DADO_PARADO_S = 5.0    # sem leitura por mais que isto -> offline
+INTERVALO_VIGIA_S = 1.0       # de quanto em quanto tempo o vigia confere
+
+# Um frontend travado (notebook suspenso, Wi-Fi caindo sem fechar o TCP) nao
+# pode prender o broadcast dos outros: quem nao aceitar a mensagem dentro
+# deste prazo e descartado. Ele reconecta sozinho depois - o frontend ja tem
+# reconexao automatica - e volta a receber tudo, inclusive o historico.
+TIMEOUT_ENVIO_CLIENTE_S = 2.0
+
+# Valores do campo "tipo" das mensagens enviadas ao frontend (ver docstring).
+TIPO_LEITURA = "leitura"
+TIPO_TICK = "tick"
 
 # --------------------------------------------------------------------------
 # Parametros da estimativa de Agtron (ver estimar_agtron abaixo)
@@ -159,13 +186,24 @@ class Estado:
         self.inicio_torra: Optional[float] = None
         # Menor Agtron ja atingido na sessao (ver processar_leitura).
         self.agtron_estimado: Optional[float] = None
+        # Relogio MONOTONICO da ultima leitura valida aceita - ou do instante
+        # em que a conexao abriu, como carencia para a primeira chegar. E o
+        # que o vigia compara. Monotonico de proposito: um ajuste do relogio
+        # do sistema no meio da torra nao pode simular uma queda.
+        self.ultimo_dado_em: Optional[float] = None
+        # Ultima vez que o vigia reavisou o frontend de que o dado parou.
+        self.ultimo_aviso_parado: float = 0.0
 
 
 estado = Estado()
 
 
 def montar_mensagem() -> dict[str, Any]:
-    """Mensagem enviada ao frontend: ultima leitura + flag de conexao."""
+    """Mensagem de LEITURA: ultima leitura + flag de conexao.
+
+    So deve ser usada quando ha uma leitura de verdade para anunciar. Para
+    avisar o frontend de mudanca de conexao sem dado novo, use montar_tick().
+    """
     base: dict[str, Any] = {
         "temp": None,
         "timestamp": None,
@@ -175,35 +213,147 @@ def montar_mensagem() -> dict[str, Any]:
     }
     if estado.ultima_leitura:
         base.update(estado.ultima_leitura)
+    base["tipo"] = TIPO_LEITURA
     base["offline"] = estado.offline
     base["tbeam_uri"] = TBEAM_URI
     return base
 
 
+def montar_tick() -> dict[str, Any]:
+    """Aviso de estado da conexao, SEM leitura nenhuma.
+
+    Vai para o frontend enquanto a placa esta fora (mantendo a flag "offline"
+    viva na tela) e no instante em que a conexao volta.
+
+    O que ele NAO carrega e o ponto todo: nada de "temp", nada de
+    "recebido_em". Reemitir a leitura velha a cada tick fazia o frontend
+    plotar de novo um ponto que ele ja tinha - o contador de leituras subia
+    sozinho durante uma queda e as duplicatas comiam o limite da serie do
+    grafico. Sem esses campos, o frontend nao tem como confundir o tick com
+    dado novo. A ultima temperatura recebida continua na tela normalmente:
+    ela vive no estado do frontend, nao nesta mensagem.
+    """
+    return {
+        "tipo": TIPO_TICK,
+        "offline": estado.offline,
+        "tbeam_uri": TBEAM_URI,
+    }
+
+
+# Tarefas soltas de encerramento de cliente. Guardadas numa referencia forte
+# porque o asyncio so mantem weakrefs para as tasks: sem isto o coletor de
+# lixo pode engolir uma delas no meio do caminho.
+_encerramentos: set[asyncio.Task] = set()
+
+
+async def _encerrar_cliente(cliente: WebSocket) -> None:
+    """Fecha um cliente descartado, sem deixar o fechamento travar tambem."""
+    try:
+        await asyncio.wait_for(cliente.close(), timeout=TIMEOUT_ENVIO_CLIENTE_S)
+    except Exception:
+        pass
+
+
+def _descartar(cliente: WebSocket, motivo: str) -> None:
+    estado.clientes.discard(cliente)
+    log.warning("Frontend descartado (%s) - %d restantes", motivo, len(estado.clientes))
+    tarefa = asyncio.create_task(_encerrar_cliente(cliente))
+    _encerramentos.add(tarefa)
+    tarefa.add_done_callback(_encerramentos.discard)
+
+
 async def enviar_para_todos(mensagem: dict[str, Any]) -> None:
-    """Broadcast para todos os frontends, descartando os que morreram."""
+    """Broadcast para todos os frontends, descartando os que morreram.
+
+    Cada envio tem prazo proprio (TIMEOUT_ENVIO_CLIENTE_S). Um cliente que nao
+    aceita a mensagem dentro dele nao esta necessariamente morto - um notebook
+    que entrou em suspensao ou perdeu o Wi-Fi sem fechar o TCP simplesmente
+    para de drenar o socket, e o "send" fica pendurado para sempre. Como este
+    broadcast roda DENTRO do laco de leitura do T-Beam, esperar por ele
+    congelaria o backend inteiro: os outros frontends parariam de receber e o
+    historico pararia de crescer. Entao o lento e cortado e segue o jogo; o
+    frontend dele reconecta sozinho e recebe o historico completo na volta.
+    """
     if not estado.clientes:
         return
-    texto = json.dumps(mensagem)
-    mortos: list[WebSocket] = []
+    try:
+        # allow_nan=False: NaN/Infinity viram os literais "NaN"/"Infinity", que
+        # nao sao JSON valido - o JSON.parse do navegador rejeita e a mensagem
+        # some sem aviso. Melhor falhar aqui, onde da para logar.
+        texto = json.dumps(mensagem, allow_nan=False)
+    except ValueError as erro:
+        log.warning("Mensagem nao serializavel descartada (%s)", erro)
+        return
+
     for cliente in list(estado.clientes):
         try:
-            await cliente.send_text(texto)
+            await asyncio.wait_for(
+                cliente.send_text(texto), timeout=TIMEOUT_ENVIO_CLIENTE_S
+            )
+        except asyncio.TimeoutError:
+            _descartar(cliente, f"nao respondeu em {TIMEOUT_ENVIO_CLIENTE_S:.0f}s")
         except Exception:
-            mortos.append(cliente)
-    for cliente in mortos:
-        estado.clientes.discard(cliente)
+            _descartar(cliente, "conexao quebrada")
 
 
 # --------------------------------------------------------------------------
 # Ponte: cliente WebSocket do T-Beam, com reconexao automatica
 # --------------------------------------------------------------------------
+def temperatura_valida(valor: Any) -> Optional[float]:
+    """Devolve o "temp" como float utilizavel, ou None se nao servir.
+
+    Esta funcao existe por um motivo bem concreto: o MAX31855 desconectado -
+    que e como o termopar vai passar boa parte do tempo enquanto o hardware
+    nao esta montado - nao produz um campo ausente. Ele produz LIXO com o
+    campo presente: null, "nan", uma string, um NaN. Sem esta peneira, esse
+    lixo chegava na aritmetica do Agtron, levantava TypeError, subia ate o
+    tratamento de erro da ponte e DERRUBAVA a conexao com a placa - que
+    reconectava, reencontrava o mesmo lixo e caia de novo, em loop.
+
+    Recusa, nesta ordem:
+      - bool  (True/False sao int em Python; "temp": true nao e 1 grau)
+      - qualquer coisa que nao seja int/float (None, str, list, dict)
+      - NaN e Infinity (numeros que existem em Python mas nao em JSON)
+    """
+    if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+        return None
+    numero = float(valor)
+    if not math.isfinite(numero):
+        return None
+    return numero
+
+
 async def processar_leitura(bruta: str) -> None:
     try:
         leitura = json.loads(bruta)
     except json.JSONDecodeError:
-        log.warning("Mensagem invalida vinda do T-Beam: %r", bruta[:120])
+        log.warning("Leitura descartada (JSON invalido): %r", bruta[:120])
         return
+
+    # JSON valido nao quer dizer OBJETO: "[1,2]", "42" e "null" sao todos JSON
+    # perfeitamente valido. Sem esta checagem, a atribuicao logo abaixo
+    # levantaria TypeError e derrubaria a conexao com a placa.
+    if not isinstance(leitura, dict):
+        log.warning(
+            "Leitura descartada (esperava objeto JSON, veio %s): %r",
+            type(leitura).__name__,
+            bruta[:120],
+        )
+        return
+
+    temp = temperatura_valida(leitura.get("temp"))
+    if temp is None:
+        log.warning("Leitura descartada (temp invalida): %r", bruta[:120])
+        return
+    # Normaliza: daqui para baixo (historico, frontend, grafico) "temp" e
+    # sempre um float finito, nunca um int nem um numero em forma de texto.
+    leitura["temp"] = temp
+
+    # A partir daqui a leitura e valida: o vigia pode recomecar a contar.
+    estado.ultimo_dado_em = time.monotonic()
+    if estado.offline:
+        estado.offline = False
+        log.info("T-Beam voltou a enviar leituras")
 
     # Carimbo do backend: o timestamp do T-Beam e millis() desde o boot dele,
     # entao guardamos tambem o relogio real para o grafico e para logs.
@@ -214,7 +364,7 @@ async def processar_leitura(bruta: str) -> None:
         estado.inicio_torra = leitura["recebido_em"]
     tempo_decorrido = leitura["recebido_em"] - estado.inicio_torra
 
-    agtron = estimar_agtron(leitura.get("temp", 0.0), tempo_decorrido)
+    agtron = estimar_agtron(temp, tempo_decorrido)
 
     # Trava de sentido unico: torrar e irreversivel - grao nao clareia. Sem
     # isto, baixar a potencia faria o Agtron SUBIR na tela, o que nao existe
@@ -247,11 +397,26 @@ async def ponte_tbeam() -> None:
             ) as conexao:
                 estado.conexao_tbeam = conexao
                 estado.offline = False
+                # Carencia: o vigia so comeca a cobrar a primeira leitura a
+                # partir de agora, e nao desde a ultima da conexao anterior.
+                estado.ultimo_dado_em = time.monotonic()
                 log.info("T-Beam CONECTADO")
-                await enviar_para_todos(montar_mensagem())
+                # Tick, e nao leitura: a conexao voltou, mas dado novo ainda
+                # nao chegou. Mandar a leitura velha aqui faria o frontend
+                # plotar outra vez um ponto que ele ja tem.
+                await enviar_para_todos(montar_tick())
 
                 async for bruta in conexao:
-                    await processar_leitura(bruta)
+                    # Rede de seguranca: processar_leitura ja peneira payload
+                    # ruim sozinha, mas um erro inesperado aqui dentro nao
+                    # pode quebrar o "async for" e derrubar uma conexao que
+                    # esta viva. Descarta-se a leitura, nunca a conexao.
+                    try:
+                        await processar_leitura(bruta)
+                    except Exception as erro:
+                        log.warning(
+                            "Leitura descartada (%s: %s)", type(erro).__name__, erro
+                        )
 
         except asyncio.CancelledError:
             raise
@@ -270,8 +435,56 @@ async def ponte_tbeam() -> None:
         # Reavisa o frontend a cada tentativa frustrada, e nao so na primeira:
         # enquanto a placa estiver fora, este broadcast se repete a cada
         # INTERVALO_RECONEXAO_S, mantendo a flag "offline" viva na tela.
-        await enviar_para_todos(montar_mensagem())
+        # E um TICK - nao ha leitura nova para anunciar aqui.
+        await enviar_para_todos(montar_tick())
+        estado.ultimo_aviso_parado = time.monotonic()
         await asyncio.sleep(INTERVALO_RECONEXAO_S)
+
+
+async def vigia_dado_parado() -> None:
+    """Marca offline quando as leituras param, mesmo com o socket vivo.
+
+    A ponte so descobre uma queda quando o socket acusa: ou o TCP fecha, ou o
+    ping/pong estoura. Quando o Wi-Fi da placa cai, nada disso acontece de
+    imediato - o socket fica aberto, calado, e o ping so o condena depois de
+    ping_interval + ping_timeout (ate ~40 s). Nesses 40 s a tela mostrava
+    "cadeia completa" com a temperatura congelada, que e exatamente o que nao
+    se pode fazer na frente de quem esta acompanhando uma torra.
+
+    Este vigia olha so para o dado: se a ultima leitura valida ja tem mais de
+    LIMITE_DADO_PARADO_S, o T-Beam esta fora para todos os efeitos praticos -
+    inclusive para /comando, que passa a recusar em vez de fingir que
+    entregou. A conexao em si continua por conta da ponte; quando a leitura
+    voltar, processar_leitura desmarca o offline sozinha.
+    """
+    while True:
+        await asyncio.sleep(INTERVALO_VIGIA_S)
+
+        if estado.ultimo_dado_em is None:
+            continue  # nenhuma conexao ainda: nao ha o que vigiar
+        parado_ha = time.monotonic() - estado.ultimo_dado_em
+        if parado_ha < LIMITE_DADO_PARADO_S:
+            continue
+
+        if not estado.offline:
+            estado.offline = True
+            log.warning(
+                "Sem leitura ha %.1fs - T-Beam considerado OFFLINE "
+                "(socket ainda aberto: %s)",
+                parado_ha,
+                estado.conexao_tbeam is not None,
+            )
+            await enviar_para_todos(montar_tick())
+            estado.ultimo_aviso_parado = time.monotonic()
+        elif estado.conexao_tbeam is not None:
+            # Socket aberto porem mudo: a ponte esta parada no "async for" e
+            # nao reavisa ninguem, entao o tick periodico e responsabilidade
+            # daqui. Se o socket ja tivesse caido, a propria ponte reavisaria
+            # a cada tentativa de reconexao - e nos calariamos para nao
+            # duplicar o aviso.
+            if time.monotonic() - estado.ultimo_aviso_parado >= INTERVALO_RECONEXAO_S:
+                await enviar_para_todos(montar_tick())
+                estado.ultimo_aviso_parado = time.monotonic()
 
 
 # --------------------------------------------------------------------------
@@ -281,6 +494,7 @@ async def ponte_tbeam() -> None:
 async def ciclo_de_vida(app: FastAPI):
     tarefas = [
         asyncio.create_task(ponte_tbeam(), name="ponte_tbeam"),
+        asyncio.create_task(vigia_dado_parado(), name="vigia_dado_parado"),
     ]
     log.info("Backend no ar. Frontend deve conectar em /ws/temperatura")
     try:
@@ -312,11 +526,20 @@ class Comando(BaseModel):
 
 @app.get("/status")
 async def status() -> dict[str, Any]:
+    sem_leitura_ha = (
+        None
+        if estado.ultimo_dado_em is None
+        else round(time.monotonic() - estado.ultimo_dado_em, 1)
+    )
     return {
         "offline": estado.offline,
         "tbeam_uri": TBEAM_URI,
         "leituras_no_historico": len(estado.historico),
         "frontends_conectados": len(estado.clientes),
+        # Diagnostico de bancada: com o socket aberto e este numero crescendo,
+        # o problema e a placa ter emudecido, nao a rede ter caido.
+        "socket_tbeam_aberto": estado.conexao_tbeam is not None,
+        "sem_leitura_ha": sem_leitura_ha,
         "ultima_leitura": estado.ultima_leitura,
     }
 
@@ -325,6 +548,37 @@ async def status() -> dict[str, Any]:
 async def historico() -> dict[str, Any]:
     """Curva completa da sessao atual (para montar o grafico de uma vez)."""
     return {"total": len(estado.historico), "leituras": estado.historico}
+
+
+@app.post("/sessao/nova")
+async def sessao_nova() -> dict[str, Any]:
+    """Zera a sessao de torra sem reiniciar o backend.
+
+    Serve para encadear demonstracoes: entre uma torra e outra, isto devolve o
+    sistema ao estado "nada torrado ainda" - historico vazio, cronometro da
+    torra zerado e Agtron solto da trava de sentido unico - sem derrubar o
+    processo, sem derrubar os frontends conectados e sem mexer na conexao com
+    o T-Beam, que segue exatamente como estava.
+
+    Zerar inicio_torra importa mais do que parece: ele e o CHARGE implicito da
+    sessao. Com o backend ligado desde a montagem do equipamento, o "tempo de
+    torra" ja chegaria saturado no cafe seguinte e a estimativa de Agtron
+    escureceria rapido demais.
+
+    O broadcast final leva "historico": [], que e exatamente o formato que o
+    frontend ja usa para redesenhar a curva do zero - nenhuma mudanca do lado
+    dele foi necessaria para isto funcionar.
+    """
+    descartadas = len(estado.historico)
+
+    estado.historico = []
+    estado.inicio_torra = None
+    estado.agtron_estimado = None
+
+    await enviar_para_todos({**montar_mensagem(), "historico": []})
+
+    log.info("Sessao zerada (%d leituras descartadas)", descartadas)
+    return {"ok": True, "leituras_descartadas": descartadas}
 
 
 @app.post("/comando")
