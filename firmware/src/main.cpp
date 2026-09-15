@@ -47,10 +47,22 @@
 #include <ArduinoJson.h>
 
 /* ------------------------------------------------------------------------ */
-/*  CONFIGURACAO - troque pelos dados da sua rede antes de gravar            */
+/*  CREDENCIAIS DA REDE                                                      */
 /* ------------------------------------------------------------------------ */
-const char *WIFI_SSID     = "SUA_REDE_AQUI";
-const char *WIFI_PASSWORD = "SUA_SENHA_AQUI";
+/*  Ficam FORA do git, em include/credenciais.h. Antes de gravar a placa:    */
+/*                                                                           */
+/*      cp include/credenciais.exemplo.h include/credenciais.h               */
+/*      (e preencha o SSID e a senha no arquivo copiado)                     */
+/*                                                                           */
+/*  O arquivo copiado esta no .gitignore. Este esquema existe para que uma   */
+/*  senha preenchida as pressas para testar nunca acabe publicada junto com  */
+/*  um commit de outra coisa.                                                */
+/* ------------------------------------------------------------------------ */
+#if __has_include("credenciais.h")
+  #include "credenciais.h"
+#else
+  #error "Falta include/credenciais.h -- copie de include/credenciais.exemplo.h e preencha."
+#endif
 
 const uint16_t PORTA_HTTP        = 80;     // servidor HTTP + WebSocket
 const char    *CAMINHO_WEBSOCKET = "/ws";  // ws://<ip-do-tbeam>/ws
