@@ -71,13 +71,8 @@ def _preparar_camera():
 
 
 # --------------------------------------------------------------------------
-def cmd_preview(args):
-    cap, _ = _preparar_camera()
-    frame = camera.media_de_frames(cap)
-    cap.release()
-
-    m = camera.medir(frame)
-
+def _salvar_preview(frame):
+    """Grava o frame com as miras desenhadas e devolve o caminho."""
     vis = frame.astype(np.uint8).copy()
     for mira, cor, rotulo in (
         (camera.MIRA_AMOSTRA, (0, 220, 0), "AMOSTRA"),
@@ -91,13 +86,38 @@ def cmd_preview(args):
     os.makedirs(DIR_DADOS, exist_ok=True)
     destino = os.path.join(DIR_DADOS, "preview.png")
     cv2.imwrite(destino, vis)
+    return destino
+
+
+def cmd_preview(args):
+    cap, _ = _preparar_camera()
+    try:
+        frame = camera.media_de_frames(cap)
+    finally:
+        cap.release()
+
+    # A IMAGEM E SALVA ANTES DE MEDIR, DE PROPOSITO. Quando a medida falha por
+    # mira estourada ou mal posicionada, e exatamente quando voce mais precisa
+    # ver o quadro para corrigir. Medir primeiro faria o preview morrer sem
+    # deixar justamente a imagem que explica o problema.
+    destino = _salvar_preview(frame)
+    print(f"\nPreview salvo em: {destino}")
+    print("Abra, confira se as miras estao no lugar e ajuste MIRA_AMOSTRA /")
+    print("MIRA_REFERENCIA em visao/camera.py se precisar.")
+
+    try:
+        m = camera.medir(frame)
+    except camera.CameraSemImagem as e:
+        print(f"\nNAO DEU PARA MEDIR ESTE QUADRO:\n{e}")
+        print("\nO preview acima continua valendo para ajustar o enquadramento.")
+        # Sai com erro mesmo tendo salvo o PNG: o preview cumpriu a parte de
+        # mostrar o quadro, mas medida nao houve, e quem chamar isto de um
+        # script precisa saber disso pelo codigo de saida, nao so pelo texto.
+        raise SystemExit(1)
 
     print(f"\namostra     L*={m['L']:6.2f}  a*={m['a']:6.2f}  b*={m['b']:6.2f}"
           f"   desvio_L={m['desvio_L']:.2f}")
     print(f"referencia  L*={m['L_ref']:6.2f}  a*={m['a_ref']:6.2f}  b*={m['b_ref']:6.2f}")
-    print(f"\nPreview salvo em: {destino}")
-    print("Abra, confira se as miras estao no lugar e ajuste MIRA_AMOSTRA /")
-    print("MIRA_REFERENCIA em visao/camera.py se precisar.")
     if m["desvio_L"] > 12:
         print(f"\nATENCAO: desvio_L={m['desvio_L']:.1f} esta alto. A mira pode estar")
         print("pegando fundo, borda do recipiente ou sombra, nao so grao.")
@@ -111,6 +131,7 @@ def cmd_capturar(args):
     novo = not os.path.exists(CSV_SAIDA)
 
     linhas = []
+    interrompido = None
     try:
         for i in range(1, args.repeticoes + 1):
             print(f"\n--- {args.amostra}, repeticao {i}/{args.repeticoes} ---")
@@ -140,21 +161,35 @@ def cmd_capturar(args):
             })
             print(f"  L*={m['L']:6.2f}  a*={m['a']:6.2f}  b*={m['b']:6.2f}  "
                   f"desvio_L={m['desvio_L']:5.2f}  L_norm={m['L_norm']:6.2f}")
+    except (camera.CameraSemImagem, KeyboardInterrupt) as e:
+        # NAO PERDER O QUE JA FOI COLETADO. Cada repeticao custa mexer nos graos
+        # e esperar; deixar a ultima repeticao estourada apagar as anteriores
+        # seria o pior jeito possivel de falhar. Grava o que tem e so DEPOIS
+        # propaga o erro.
+        interrompido = e
     finally:
         cap.release()
 
-    with open(CSV_SAIDA, "a", newline="", encoding="utf-8") as f:
-        escritor = csv.DictWriter(f, fieldnames=COLUNAS)
-        if novo:
-            escritor.writeheader()
-        escritor.writerows(linhas)
+    if linhas:
+        with open(CSV_SAIDA, "a", newline="", encoding="utf-8") as f:
+            escritor = csv.DictWriter(f, fieldnames=COLUNAS)
+            if novo:
+                escritor.writeheader()
+            escritor.writerows(linhas)
 
-    Ls = [linha["L"] for linha in linhas]
-    print(f"\n{len(linhas)} capturas gravadas em {CSV_SAIDA}")
-    print(f"L* medio da amostra: {np.mean(Ls):.2f}  (dispersao entre "
-          f"repeticoes: {np.std(Ls):.2f})")
-    print("\nA coluna 'agtron' ficou VAZIA de proposito: preencha quando tiver")
-    print("o valor medido desta amostra.")
+        Ls = [linha["L"] for linha in linhas]
+        print(f"\n{len(linhas)} capturas gravadas em {CSV_SAIDA}")
+        print(f"L* medio da amostra: {np.mean(Ls):.2f}  (dispersao entre "
+              f"repeticoes: {np.std(Ls):.2f})")
+        print("\nA coluna 'agtron' ficou VAZIA de proposito: preencha quando tiver")
+        print("o valor medido desta amostra.")
+
+    if interrompido is not None:
+        if isinstance(interrompido, KeyboardInterrupt):
+            raise SystemExit(
+                f"\nInterrompido por voce depois de {len(linhas)} de "
+                f"{args.repeticoes} repeticoes.")
+        raise interrompido
 
 
 # --------------------------------------------------------------------------
@@ -217,7 +252,26 @@ def main():
     sub.add_parser("resumo", help="lista o que ja foi coletado")
 
     args = p.parse_args()
-    {"preview": cmd_preview, "capturar": cmd_capturar, "resumo": cmd_resumo}[args.comando](args)
+    comandos = {"preview": cmd_preview, "capturar": cmd_capturar, "resumo": cmd_resumo}
+
+    # As falhas de camera sao PREVISTAS e cada uma pede uma acao diferente do
+    # operador, entao saem como mensagem, nao como traceback. O que NAO for
+    # falha de camera continua estourando com traceback inteiro de proposito:
+    # erro inesperado tem de parecer erro inesperado.
+    #
+    # MiraSaturada vem antes de CameraSemImagem porque herda dela.
+    try:
+        comandos[args.comando](args)
+    except camera.CameraNaoTravou as e:
+        raise SystemExit(
+            f"\n[A CAMERA NAO TRAVOU]\n{e}\n\n"
+            "Nada foi medido, de proposito: com os automaticos ligados, o que "
+            "fosse coletado mediria a reacao da camera ao cafe, nao o cafe."
+        )
+    except camera.MiraSaturada as e:
+        raise SystemExit(f"\n[MIRA ESTOURADA DE LUZ]\n{e}")
+    except camera.CameraSemImagem as e:
+        raise SystemExit(f"\n[A CAMERA NAO ENTREGOU IMAGEM]\n{e}")
 
 
 if __name__ == "__main__":
