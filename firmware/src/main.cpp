@@ -89,6 +89,24 @@ AsyncWebSocket ws(CAMINHO_WEBSOCKET);
 uint32_t ultimoEnvio   = 0;
 uint32_t ultimaAmostra = 0;
 
+// Quanto o setup() espera pelo Wi-Fi ANTES DE SEGUIR SEM ELE. Existe porque
+// ficar presto esperando rede e pior do que rodar sem ela: sem terminar o
+// setup(), a placa nao amostra, nao responde e nao diz o que houve -- ela so
+// parece morta. Um roteador reiniciando na hora errada bastava para isso.
+const uint32_t LIMITE_CONEXAO_MS = 20000;
+
+// De quanto em quanto tempo tentar de novo depois de desistir. Nao encoste
+// em valores pequenos: cada tentativa mexe no radio e atrapalha a amostragem.
+const uint32_t INTERVALO_RECONEXAO_MS = 15000;
+
+// Periodo do aviso de "estou offline". Sem isto a serial vira uma parede de
+// mensagens repetidas e esconde o que importa.
+const uint32_t INTERVALO_AVISO_OFFLINE_MS = 5000;
+
+uint32_t ultimaTentativaWiFi = 0;
+uint32_t ultimoAvisoOffline  = 0;
+bool     estavaConectado     = false;
+
 /* ==========================================================================
  *  #############   ATENCAO - PONTO DE TROCA DO SENSOR   ####################
  * ==========================================================================
@@ -307,19 +325,11 @@ void aoEventoWebSocket(AsyncWebSocket *servidorWs, AsyncWebSocketClient *cliente
 /* ------------------------------------------------------------------------ */
 /*  WI-FI                                                                    */
 /* ------------------------------------------------------------------------ */
-void conectarWiFi()
+// Imprime como chegar na placa. Sai no primeiro sucesso E a cada reconexao,
+// porque o IP pode mudar quando o DHCP renova -- e e esse IP que o backend
+// precisa ter em TBEAM_HOST. Anunciar so no boot esconderia a troca.
+void anunciarRede()
 {
-    Serial.printf("[WIFI] conectando em \"%s\"", WIFI_SSID);
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);                 // evita latencia no WebSocket
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-
-    Serial.println();
     Serial.println("[WIFI] conectado!");
     Serial.print  ("[WIFI] IP do T-Beam: ");
     Serial.println(WiFi.localIP());
@@ -328,6 +338,37 @@ void conectarWiFi()
     Serial.printf ("[WIFI] HTTP comando: http://%s/comando\n",
                    WiFi.localIP().toString().c_str());
     Serial.println("       ^^^ anote este IP: e o TBEAM_HOST do backend ^^^");
+}
+
+// Tenta conectar por no maximo LIMITE_CONEXAO_MS. Devolve se conseguiu.
+// NAO trava esperando: quem chama segue a vida de qualquer jeito.
+bool conectarWiFi()
+{
+    Serial.printf("[WIFI] conectando em \"%s\"", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);                 // evita latencia no WebSocket
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    uint32_t comeco = millis();
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - comeco < LIMITE_CONEXAO_MS) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.printf("[WIFI] nao conectou em %lu s. SEGUINDO SEM REDE.\n",
+                      LIMITE_CONEXAO_MS / 1000);
+        Serial.println("       A placa continua amostrando temperatura e vai");
+        Serial.println("       tentar reconectar sozinha. Confira o SSID e a");
+        Serial.println("       senha em include/credenciais.h, e lembre que o");
+        Serial.println("       ESP32 so fala 2,4 GHz.");
+        return false;
+    }
+
+    anunciarRede();
+    return true;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -340,7 +381,9 @@ void setup()
     Serial.println("\n\n=== Torrador de Cafe - T-Beam (temperatura SIMULADA) ===");
 
     randomSeed(esp_random());
-    conectarWiFi();
+    // O resultado nao decide se o setup() continua: o servidor e o WebSocket
+    // sao montados de qualquer jeito, prontos para quando a rede aparecer.
+    estavaConectado = conectarWiFi();
 
     ws.onEvent(aoEventoWebSocket);
     servidor.addHandler(&ws);
@@ -376,15 +419,24 @@ void loop()
 {
     ws.cleanupClients();
 
-    // Reconexao simples de Wi-Fi: se cair, o ESP32 tenta voltar sozinho.
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WIFI] caiu - reconectando...");
-        WiFi.reconnect();
-        delay(1000);
-        return;
-    }
-
     uint32_t agora = millis();
+    bool conectado = (WiFi.status() == WL_CONNECTED);
+
+    // A RECONEXAO NAO INTERROMPE MAIS A AMOSTRAGEM. Antes, o loop dava return
+    // enquanto a rede estivesse fora, e com isso a placa PARAVA DE MEDIR. Mas
+    // a torra nao espera o roteador: o cafe continua esquentando. Medir e
+    // local; o que pode faltar e so o envio.
+    if (!conectado) {
+        if (agora - ultimaTentativaWiFi >= INTERVALO_RECONEXAO_MS) {
+            ultimaTentativaWiFi = agora;
+            Serial.println("[WIFI] sem rede - tentando reconectar...");
+            WiFi.reconnect();
+        }
+    } else if (!estavaConectado) {
+        // Voltou. O IP pode ter mudado, entao anuncia de novo.
+        anunciarRede();
+    }
+    estavaConectado = conectado;
 
     // Amostragem rapida: colhe e acumula, sem mandar nada para a rede.
     if (agora - ultimaAmostra >= INTERVALO_AMOSTRAGEM_MS) {
@@ -395,7 +447,24 @@ void loop()
     // Envio: manda a MEDIA das amostras colhidas desde o envio anterior.
     if (agora - ultimoEnvio >= INTERVALO_ENVIO_MS) {
         ultimoEnvio = agora;
-        transmitirLeitura();
+
+        if (conectado) {
+            transmitirLeitura();
+        } else {
+            // O TICK DE ENVIO ACONTECE MESMO OFFLINE, DE PROPOSITO.
+            // temperaturaMedia() zera o acumulador; sem chama-la, as amostras
+            // de todo o periodo sem rede se somariam numa unica media. Quando
+            // a rede voltasse, o primeiro valor enviado seria a media de
+            // minutos inteiros -- com cara de leitura instantanea, que e o
+            // tipo de numero errado mais dificil de perceber. De quebra,
+            // qtdAmostras e uint16_t e estouraria depois de ~4,5 h offline.
+            float descartada = temperaturaMedia();
+            if (agora - ultimoAvisoOffline >= INTERVALO_AVISO_OFFLINE_MS) {
+                ultimoAvisoOffline = agora;
+                Serial.printf("[WIFI] offline: amostrando e descartando "
+                              "(ultima media %.2f C)\n", descartada);
+            }
+        }
     }
 
     delay(10);
