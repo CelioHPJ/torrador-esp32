@@ -134,6 +134,34 @@ void loop()
 
         Serial.printf("| interna=%.2f C | falhas: %lu/%lu\n",
                       interna, totalFalhas, totalLeituras);
+    } else if (celsius == 0.0 && interna == 0.0) {
+        // TUDO ZERO NAO E MEDIDA, E AUSENCIA DE COMUNICACAO.
+        //
+        // O MAX31855 devolve 32 bits de uma vez. Se o pino DO nunca sobe, a
+        // biblioteca le 32 zeros -- e 32 zeros formam um resultado
+        // perfeitamente coerente: temperatura 0,00, junta fria 0,00 e nenhum
+        // bit de falha ligado. isnan() nao pega, readError() devolve 0, e o
+        // teste imprime "0.00 C" com cara de leitura boa.
+        //
+        // O que denuncia e a JUNTA FRIA: ela e o sensor DENTRO do chip e mede
+        // a temperatura do proprio encapsulamento. Nao existe bancada em que
+        // ela marque exatamente 0,00 C. Se ela zerou, nao estamos falando com
+        // o chip -- e a temperatura ao lado dela nao vale nada.
+        totalFalhas++;
+        Serial.printf("[%lu] SEM COMUNICACAO COM O CHIP: 32 bits zerados "
+                      "(temperatura 0,00 e junta fria 0,00 ao mesmo tempo). "
+                      "| falhas: %lu/%lu\n",
+                      totalLeituras, totalFalhas, totalLeituras);
+        if (totalFalhas == 1) {
+            Serial.println("    Isto NAO e uma leitura de 0 grau. Confira, nesta ordem:");
+            Serial.println("      1. VIN do modulo em 3V3 (nao em 5V, nao solto)");
+            Serial.println("      2. GND do modulo no GND da placa");
+            Serial.println("      3. DO do modulo no GPIO 25 - e o fio que traz o dado;");
+            Serial.println("         se so ele estiver solto, da exatamente este sintoma");
+            Serial.println("      4. CLK no GPIO 13 e CS no GPIO 14 (nao troque os dois)");
+            Serial.println("      5. Se o modulo for MAX6675 e nao MAX31855, o protocolo");
+            Serial.println("         e outro e a biblioteca esta errada");
+        }
     } else {
         Serial.printf("[%lu] temperatura: %7.2f C | junta fria (chip): %6.2f C"
                       " | falhas: %lu/%lu\n",

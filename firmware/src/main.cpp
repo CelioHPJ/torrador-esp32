@@ -115,13 +115,23 @@ uint32_t ultimaAmostra = 0;
  *    2) No topo deste arquivo:
  *           #include <SPI.h>
  *           #include <Adafruit_MAX31855.h>
- *           #define PINO_MAX_CLK  <GPIO>   // ex.: 13
- *           #define PINO_MAX_CS   <GPIO>   // ex.: 14
- *           #define PINO_MAX_DO   <GPIO>   // ex.: 12
+ *           #define PINO_MAX_CLK  13
+ *           #define PINO_MAX_CS   14
+ *           #define PINO_MAX_DO   25
  *           Adafruit_MAX31855 termopar(PINO_MAX_CLK, PINO_MAX_CS, PINO_MAX_DO);
- *       (escolha GPIOs livres do T-Beam: cuidado, varios pinos ja sao
- *        usados por LoRa/GPS/AXP192 mesmo que nao estejamos usando esses
- *        perifericos nesta fase)
+ *
+ *       USE EXATAMENTE OS MESMOS PINOS DE firmware/teste_termopar, que sao
+ *       os acima. Se o teste isolado passou com uma fiacao, integrar com
+ *       outra joga fora a unica coisa que aquele teste provou.
+ *
+ *       EM ESPECIAL, NAO USE O GPIO 12 PARA O DO. Este comentario ja mandou
+ *       usar 12 e estava errado em dois sentidos: 12 e pino de strapping
+ *       (lido durante o boot, pode impedir a placa de ligar) e no T-Beam ele
+ *       ainda e usado pelo GPS. O erro so apareceria DEPOIS da integracao,
+ *       com o sensor ja provado funcionando -- e a culpa cairia na integracao.
+ *
+ *       (varios pinos do T-Beam ja sao usados por LoRa/GPS/AXP192 mesmo sem
+ *        usarmos esses perifericos nesta fase; evite tambem GPIO 0, 2 e 15)
  *
  *    3) Dentro de setup(), antes de conectarWiFi():
  *           termopar.begin();
