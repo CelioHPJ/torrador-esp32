@@ -48,13 +48,24 @@ CAMINHO_MODELO = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # substitui: sem a trava, o que ela suavizaria seria um sinal ja invertido.
 JANELA_SUAVIZACAO = 5
 
+# Entradas assumidas quando o modelo nao diz quais usou. So modelo gravado
+# antes de o treino passar a escolher o conjunto cai aqui -- era o que o
+# treinar.py fazia fixo naquela epoca.
+ENTRADAS_PADRAO = ("L", "a", "b")
+
 # Faixas usadas so para rotular a fase na tela. A escala Agtron e invertida:
 # valor ALTO e grao CLARO.
 FAIXAS_FASE = ((85, "Cru"), (65, "Clara"), (45, "Media"), (-1, "Escura"))
 
+# O que camera.medir() devolve, e portanto o que um modelo pode pedir como
+# entrada. Serve para recusar um modelo incompativel no startup.
+_COLUNAS_MEDIDAS = ("L", "a", "b", "L_ref", "a_ref", "b_ref", "L_norm",
+                    "desvio_L")
+
 _estado = {
     "modelo": None,
     "meta": None,
+    "entradas": ENTRADAS_PADRAO,
     "cap": None,
     "formato": None,
     "indisponivel": "nao iniciado",
@@ -117,6 +128,21 @@ def iniciar():
 
         _estado.update(modelo=payload["modelo"], meta=payload.get("meta", {}))
 
+        # O modelo diz em quais colunas foi treinado, e e nelas que ler() monta
+        # o vetor. Conferido AQUI, no startup, e nao na primeira leitura: um
+        # modelo pedindo coluna que camera.medir() nao produz e erro de
+        # instalacao, e erro de instalacao tem de aparecer quando o sistema
+        # sobe, nao no meio de uma torra.
+        entradas = tuple(_estado["meta"].get("entradas") or ENTRADAS_PADRAO)
+        desconhecidas = [c for c in entradas if c not in _COLUNAS_MEDIDAS]
+        if desconhecidas:
+            motivo = (f"o modelo foi treinado em {desconhecidas}, que "
+                      "camera.medir() nao produz")
+            _estado.update(modelo=None, meta=None, indisponivel=motivo)
+            return _estado["indisponivel"]
+        _estado["entradas"] = entradas
+        print(f"[VISAO] modelo treinado em {', '.join(entradas)}")
+
         # Conferida ANTES de mexer na camera: e uma comparacao entre o modelo e
         # visao/camera.py, nao depende de a camera estar plugada. Deixar para
         # depois esconderia o aviso justamente de quem esta configurando o
@@ -164,7 +190,21 @@ def ler():
             _estado["indisponivel"] = f"camera: {e}"
             return None
 
-        entrada = np.array([[medida["L"], medida["a"], medida["b"]]])
+        valores = [medida[coluna] for coluna in _estado["entradas"]]
+        if not all(np.isfinite(valores)):
+            # L_norm vira NaN quando a referencia de cinza le ~0 -- cartao fora
+            # do quadro, ou mira de referencia na sombra. Predizer com NaN
+            # devolveria NaN, que atravessaria a media movel e sairia como
+            # "medida" no painel.
+            _estado["indisponivel"] = (
+                "medida invalida: " +
+                ", ".join(f"{c}={v}" for c, v in zip(_estado["entradas"], valores)
+                          if not np.isfinite(v)) +
+                " (cartao de cinza fora do quadro?)"
+            )
+            return None
+
+        entrada = np.array([valores], dtype=float)
         bruto = float(_estado["modelo"].predict(entrada)[0])
 
         _buffer.append(bruto)
