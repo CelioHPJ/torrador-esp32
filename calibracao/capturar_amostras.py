@@ -17,7 +17,12 @@
      python capturar_amostras.py preview
 
      # 2) capturar cada amostra (repete 5x, mexendo nos graos entre elas)
-     python capturar_amostras.py capturar --amostra clara_01
+     python capturar_amostras.py capturar --amostra agtron_95
+
+ NOMEIE A AMOSTRA COM O NIVEL -- agtron_95, agtron_85, ... agtron_25. O
+ rotulo e deduzido do nome e a coluna 'agtron' ja sai preenchida, o que
+ dispensa editar 40 linhas a mao depois. Para nome em outro formato, use
+ --agtron 95. Se os dois existirem e discordarem, nada e capturado.
 
      # 3) conferir o que ja foi coletado
      python capturar_amostras.py resumo
@@ -34,6 +39,7 @@
 import argparse
 import csv
 import os
+import re
 import sys
 from datetime import datetime
 
@@ -58,7 +64,8 @@ COLUNAS = [
     "desvio_L",                         # dispersao dentro da mira
     "exposicao", "temp_cor", "ganho",
     "arquivo_frame",
-    "agtron",                           # PREENCHER DEPOIS, com o valor medido
+    "agtron",                           # do nome da amostra, de --agtron, ou
+                                        # preenchida a mao depois
 ]
 
 
@@ -123,8 +130,47 @@ def cmd_preview(args):
         print("pegando fundo, borda do recipiente ou sombra, nao so grao.")
 
 
+# Nome no formato agtron_95 / agtron-95 / agtron95. E a convencao do
+# CHECKLIST.md justamente para o rotulo poder ser deduzido daqui.
+PADRAO_NOME_ROTULADO = re.compile(r"^agtron[_-]?(\d+(?:[.,]\d+)?)$",
+                                  re.IGNORECASE)
+
+
+def rotulo_da_amostra(nome, explicito):
+    """Decide o Agtron desta amostra: o informado, ou o que o nome diz.
+
+    Preencher a coluna depois, a mao, e 40 linhas de digitacao num arquivo em
+    que uma celula trocada nao da erro nenhum -- so um modelo pior. Quando o
+    nome carrega o nivel, o rotulo vem de graca e a digitacao some.
+
+    Se os dois existirem e discordarem, isso PARA. Uma amostra chamada
+    agtron_95 gravada como 85 e exatamente o erro que a conferencia de ordem
+    do resumo existe para pegar, e e melhor pegar antes de fotografar.
+    """
+    casou = PADRAO_NOME_ROTULADO.match(nome)
+    do_nome = float(casou.group(1).replace(",", ".")) if casou else None
+
+    if explicito is not None and do_nome is not None and explicito != do_nome:
+        raise SystemExit(
+            f"\nO nome da amostra diz Agtron {do_nome:g} e --agtron diz "
+            f"{explicito:g}. Nada foi capturado.\nCorrija um dos dois -- e "
+            "confira qual amostra esta de fato na bancada."
+        )
+
+    valor = explicito if explicito is not None else do_nome
+    if valor is None:
+        return "", None
+    origem = "informado por --agtron" if explicito is not None else \
+             "deduzido do nome da amostra"
+    return f"{valor:g}", origem
+
+
 # --------------------------------------------------------------------------
 def cmd_capturar(args):
+    rotulo, origem_rotulo = rotulo_da_amostra(args.amostra, args.agtron)
+    if origem_rotulo:
+        print(f"[ROTULO] Agtron {rotulo} ({origem_rotulo})")
+
     cap, travados = _preparar_camera()
 
     os.makedirs(DIR_FRAMES, exist_ok=True)
@@ -157,7 +203,7 @@ def cmd_capturar(args):
                 "L_norm": round(m["L_norm"], 4), "desvio_L": round(m["desvio_L"], 4),
                 "exposicao": travados["exposicao"], "temp_cor": travados["temp_cor"],
                 "ganho": travados["ganho"], "arquivo_frame": nome,
-                "agtron": "",
+                "agtron": rotulo,
             })
             print(f"  L*={m['L']:6.2f}  a*={m['a']:6.2f}  b*={m['b']:6.2f}  "
                   f"desvio_L={m['desvio_L']:5.2f}  L_norm={m['L_norm']:6.2f}")
@@ -181,8 +227,12 @@ def cmd_capturar(args):
         print(f"\n{len(linhas)} capturas gravadas em {CSV_SAIDA}")
         print(f"L* medio da amostra: {np.mean(Ls):.2f}  (dispersao entre "
               f"repeticoes: {np.std(Ls):.2f})")
-        print("\nA coluna 'agtron' ficou VAZIA de proposito: preencha quando tiver")
-        print("o valor medido desta amostra.")
+        if rotulo:
+            print(f"\nColuna 'agtron' preenchida com {rotulo} nas "
+                  f"{len(linhas)} linhas.")
+        else:
+            print("\nA coluna 'agtron' ficou VAZIA: preencha quando tiver o valor")
+            print("desta amostra, ou use --agtron / nomeie a amostra agtron_<nivel>.")
 
     if interrompido is not None:
         if isinstance(interrompido, KeyboardInterrupt):
@@ -246,8 +296,11 @@ def main():
 
     c = sub.add_parser("capturar", help="captura uma amostra varias vezes")
     c.add_argument("--amostra", required=True,
-                   help="identificador da amostra (ex.: clara_01)")
+                   help="identificador da amostra; agtron_<nivel> ja rotula (ex.: agtron_95)")
     c.add_argument("--repeticoes", type=int, default=REPETICOES_PADRAO)
+    c.add_argument("--agtron", type=float, default=None,
+                   help="valor de Agtron desta amostra; dispensa preencher o "
+                        "CSV depois. Deduzido do nome se ele for agtron_<nivel>")
 
     sub.add_parser("resumo", help="lista o que ja foi coletado")
 
