@@ -39,6 +39,7 @@ import json
 import logging
 import math
 import os
+import sys
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
@@ -47,6 +48,20 @@ import websockets
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+# O modulo de visao mora na raiz do repositorio, um nivel acima daqui.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# IMPORTADO ASSIM DE PROPOSITO. visao/ depende de opencv, numpy e scikit-learn;
+# um backend instalado so com as dependencias de rede sobe sem eles e tem de
+# continuar entregando temperatura. Um problema de visao nunca pode derrubar a
+# telemetria -- e a mesma regra que agtron.iniciar() ja segue por dentro.
+try:
+    from visao import agtron
+    ERRO_IMPORT_VISAO = None
+except Exception as e:                                # noqa: BLE001
+    agtron = None
+    ERRO_IMPORT_VISAO = f"modulo visao nao pode ser importado: {e}"
 
 # --------------------------------------------------------------------------
 # Configuracao
@@ -75,6 +90,28 @@ TIMEOUT_ENVIO_CLIENTE_S = 2.0
 # Valores do campo "tipo" das mensagens enviadas ao frontend (ver docstring).
 TIPO_LEITURA = "leitura"
 TIPO_TICK = "tick"
+
+# --------------------------------------------------------------------------
+# Visao (Agtron MEDIDO, por camera)
+# --------------------------------------------------------------------------
+# TORRADOR_VISAO=0 desliga sem desinstalar nada -- util na bancada de rede,
+# onde a camera nao esta e nao ha o que medir.
+VISAO_LIGADA = os.getenv("TORRADOR_VISAO", "1").strip().lower() not in (
+    "0", "false", "nao", "no")
+
+# A captura roda em laco PROPRIO, e nao dentro de processar_leitura(). A razao
+# e a mesma que faz o vigia de dado parado existir: a cadeia de temperatura nao
+# pode ficar refem de outro subsistema. Uma captura demora ~30 ms quando tudo
+# vai bem, mas o caminho dshow fala com um processo do Windows por um pipe, e
+# pipe trava. Acoplado ao laco de leitura, um travamento desses seguraria a
+# mensagem de temperatura de 1 s -- exatamente o que nao pode acontecer no meio
+# de uma torra. Desacoplado, a temperatura segue e o campo medido envelhece.
+VISAO_INTERVALO_S = float(os.getenv("TORRADOR_VISAO_INTERVALO", "2.0"))
+
+# Depois de quanto tempo sem captura nova a ultima medida deixa de ser
+# publicada. Sem isto, uma camera que parou entregaria para sempre o mesmo
+# Agtron, que envelheceria em silencio enquanto o cafe escurece na tela ao lado.
+VISAO_VALIDADE_S = 10.0
 
 # --------------------------------------------------------------------------
 # Parametros da estimativa de Agtron (ver estimar_agtron abaixo)
@@ -193,9 +230,32 @@ class Estado:
         self.ultimo_dado_em: Optional[float] = None
         # Ultima vez que o vigia reavisou o frontend de que o dado parou.
         self.ultimo_aviso_parado: float = 0.0
+        # Ultima leitura da camera (dict de visao/agtron.ler()) e o relogio
+        # monotonico em que ela chegou. None enquanto nao houver medida.
+        self.visao_leitura: Optional[dict[str, Any]] = None
+        self.visao_lida_em: Optional[float] = None
+        # Por que nao ha medida. Fica visivel no /status e em toda mensagem:
+        # ausencia de medida com motivo e informacao; ausencia calada e bug.
+        self.visao_motivo: Optional[str] = "visao ainda nao iniciada"
 
 
 estado = Estado()
+
+
+def agtron_medido_agora() -> tuple[Optional[float], Optional[str]]:
+    """O Agtron MEDIDO valido neste instante, e o motivo quando nao ha um.
+
+    Medida vencida conta como ausencia de medida. A alternativa -- seguir
+    publicando o ultimo valor -- e pior do que nao publicar nada: o numero
+    continuaria na tela com cara de atual enquanto o cafe escurece, e ninguem
+    teria como perceber que ele congelou.
+    """
+    if estado.visao_leitura is None or estado.visao_lida_em is None:
+        return None, estado.visao_motivo
+    idade = time.monotonic() - estado.visao_lida_em
+    if idade > VISAO_VALIDADE_S:
+        return None, f"ultima medida ha {idade:.0f} s (limite {VISAO_VALIDADE_S:.0f} s)"
+    return estado.visao_leitura["agtron"], None
 
 
 def montar_mensagem() -> dict[str, Any]:
@@ -210,12 +270,17 @@ def montar_mensagem() -> dict[str, Any]:
         "potencia_atual": None,
         "motor_ligado": None,
         "agtron_estimado": None,
+        # Campo NOVO, ao lado do estimado -- nunca no lugar dele. Enquanto a
+        # medida nao estiver provada em torra, os dois numeros convivem na
+        # tela, escritos com todas as letras. A heuristica so sai depois.
+        "agtron_medido": None,
     }
     if estado.ultima_leitura:
         base.update(estado.ultima_leitura)
     base["tipo"] = TIPO_LEITURA
     base["offline"] = estado.offline
     base["tbeam_uri"] = TBEAM_URI
+    base["visao_motivo"] = agtron_medido_agora()[1]
     return base
 
 
@@ -237,6 +302,9 @@ def montar_tick() -> dict[str, Any]:
         "tipo": TIPO_TICK,
         "offline": estado.offline,
         "tbeam_uri": TBEAM_URI,
+        # Estado da visao viaja no tick tambem: ele nao e dado de leitura, e
+        # condicao do sistema. Com a placa fora, e a unica mensagem que chega.
+        "visao_motivo": agtron_medido_agora()[1],
     }
 
 
@@ -375,6 +443,16 @@ async def processar_leitura(bruta: str) -> None:
     estado.agtron_estimado = agtron
 
     leitura["agtron_estimado"] = agtron
+
+    # ---- Agtron MEDIDO, se a visao tiver algo a dizer --------------------
+    # Sem trava de sentido unico aqui, ao contrario do estimado. A trava existe
+    # porque a heuristica e monotona por construcao e subir seria um artefato
+    # dela. A medida nao: se ela sobe, ou o cafe foi trocado, ou a mira saiu do
+    # lugar, ou a luz mudou. Forcar monotonicidade esconderia justamente os
+    # tres. Medida se publica como veio.
+    medido, _motivo = agtron_medido_agora()
+    leitura["agtron_medido"] = medido
+
     leitura["tempo_torra"] = round(tempo_decorrido, 1)
     # ---------------------------------------------------------------------
 
@@ -382,6 +460,63 @@ async def processar_leitura(bruta: str) -> None:
     estado.historico.append(leitura)
 
     await enviar_para_todos(montar_mensagem())
+
+
+async def laco_visao() -> None:
+    """Mede o Agtron pela camera no proprio ritmo, sem tocar no laco de leitura.
+
+    Tudo que pode falhar aqui -- modulo ausente, modelo nao treinado, camera
+    fora, mira estourada -- vira um MOTIVO guardado no estado, nunca uma
+    excecao que suba. O backend existe para entregar temperatura; a visao e um
+    acrescimo, e acrescimo que derruba o principal nao e acrescimo.
+
+    A inicializacao roda em thread porque trava a camera falando com um
+    processo do Windows, o que pode levar dezenas de segundos. No laco de
+    eventos, isso seguraria o backend inteiro no startup.
+
+    SO HA UMA TENTATIVA DE INICIAR. Se ela falhar, o motivo fica publicado e o
+    laco encerra em vez de insistir: reiniciar exige reabrir a camera, e uma
+    retentativa periodica que gasta dezenas de segundos cada uma faria o
+    backend passar a vida tentando. Na bancada, o gesto certo e resolver o que
+    o motivo aponta e subir o backend de novo.
+    """
+    if not VISAO_LIGADA:
+        estado.visao_motivo = "desligada por TORRADOR_VISAO=0"
+        log.info("Visao desligada por variavel de ambiente.")
+        return
+
+    if agtron is None:
+        estado.visao_motivo = ERRO_IMPORT_VISAO
+        log.warning("Visao indisponivel: %s", ERRO_IMPORT_VISAO)
+        return
+
+    motivo = await asyncio.to_thread(agtron.iniciar)
+    if motivo:
+        estado.visao_motivo = motivo
+        log.warning("Visao nao iniciou: %s", motivo)
+        return
+
+    estado.visao_motivo = None
+    log.info("Visao iniciada. Medindo a cada %.1f s", VISAO_INTERVALO_S)
+    try:
+        while True:
+            leitura = await asyncio.to_thread(agtron.ler)
+            if leitura is None:
+                estado.visao_leitura = None
+                estado.visao_lida_em = None
+                novo_motivo = agtron.motivo_indisponivel()
+                if novo_motivo != estado.visao_motivo:
+                    log.warning("Visao parou de medir: %s", novo_motivo)
+                estado.visao_motivo = novo_motivo
+            else:
+                estado.visao_leitura = leitura
+                estado.visao_lida_em = time.monotonic()
+                estado.visao_motivo = None
+            await asyncio.sleep(VISAO_INTERVALO_S)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        await asyncio.to_thread(agtron.encerrar)
 
 
 async def ponte_tbeam() -> None:
@@ -495,6 +630,7 @@ async def ciclo_de_vida(app: FastAPI):
     tarefas = [
         asyncio.create_task(ponte_tbeam(), name="ponte_tbeam"),
         asyncio.create_task(vigia_dado_parado(), name="vigia_dado_parado"),
+        asyncio.create_task(laco_visao(), name="laco_visao"),
     ]
     log.info("Backend no ar. Frontend deve conectar em /ws/temperatura")
     try:
@@ -541,6 +677,12 @@ async def status() -> dict[str, Any]:
         "socket_tbeam_aberto": estado.conexao_tbeam is not None,
         "sem_leitura_ha": sem_leitura_ha,
         "ultima_leitura": estado.ultima_leitura,
+        "visao": {
+            "ligada": VISAO_LIGADA,
+            "medindo": agtron_medido_agora()[0] is not None,
+            "motivo": agtron_medido_agora()[1],
+            "ultima": estado.visao_leitura,
+        },
     }
 
 
