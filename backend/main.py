@@ -12,12 +12,14 @@
    1. Conectar como CLIENTE no WebSocket do T-Beam, com reconexao automatica.
    2. Reexpor as leituras num WebSocket PROPRIO em /ws/temperatura.
    3. Guardar o historico da sessao em memoria (lista simples, sem banco).
-   4. Receber POST /comando do frontend e repassar para o T-Beam.
-   5. Nunca travar nem cair se o T-Beam sumir: marca "offline": true nas
+   4. Nunca travar nem cair se o T-Beam sumir: marca "offline": true nas
       mensagens enviadas ao frontend e segue tentando reconectar em background.
-   6. Zerar a sessao sob demanda (POST /sessao/nova), sem reiniciar o processo.
+   5. Zerar a sessao sob demanda (POST /sessao/nova), sem reiniciar o processo.
 
  O frontend NUNCA fala direto com o T-Beam - so com este backend.
+
+ SO LEITURA: nada vai do backend para a placa. O torrador e uma pipoqueira
+ de ar quente que a placa nao aciona - ela so mede.
 
  DUAS FORMAS DE MENSAGEM saem daqui, separadas pelo campo "tipo":
    "leitura" - uma leitura nova do T-Beam. Tem "temp" e "recebido_em", e e
@@ -42,12 +44,11 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 import websockets
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
 
 # O modulo de visao mora na raiz do repositorio, um nivel acima daqui.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -211,7 +212,7 @@ class Estado:
         self.ultima_leitura: Optional[dict[str, Any]] = None
         # True enquanto nao houver conexao viva com o T-Beam.
         self.offline: bool = True
-        # Conexao WebSocket aberta com o T-Beam (usada para enviar comandos).
+        # Conexao WebSocket aberta com o T-Beam (None enquanto nao houver).
         self.conexao_tbeam: Optional[Any] = None
         # Clientes (frontends) conectados no nosso proprio WebSocket.
         self.clientes: set[WebSocket] = set()
@@ -267,8 +268,6 @@ def montar_mensagem() -> dict[str, Any]:
     base: dict[str, Any] = {
         "temp": None,
         "timestamp": None,
-        "potencia_atual": None,
-        "motor_ligado": None,
         "agtron_estimado": None,
         # Campo NOVO, ao lado do estimado -- nunca no lugar dele. Enquanto a
         # medida nao estiver provada em torra, os dois numeros convivem na
@@ -435,7 +434,7 @@ async def processar_leitura(bruta: str) -> None:
     agtron = estimar_agtron(temp, tempo_decorrido)
 
     # Trava de sentido unico: torrar e irreversivel - grao nao clareia. Sem
-    # isto, baixar a potencia faria o Agtron SUBIR na tela, o que nao existe
+    # isto, o calor diminuindo faria o Agtron SUBIR na tela, o que nao existe
     # no mundo real. A trava vive aqui, e nao dentro de estimar_agtron, para
     # que aquela funcao continue sendo um calculo puro e facil de trocar.
     if estado.agtron_estimado is not None:
@@ -587,9 +586,8 @@ async def vigia_dado_parado() -> None:
     se pode fazer na frente de quem esta acompanhando uma torra.
 
     Este vigia olha so para o dado: se a ultima leitura valida ja tem mais de
-    LIMITE_DADO_PARADO_S, o T-Beam esta fora para todos os efeitos praticos -
-    inclusive para /comando, que passa a recusar em vez de fingir que
-    entregou. A conexao em si continua por conta da ponte; quando a leitura
+    LIMITE_DADO_PARADO_S, o T-Beam esta fora para todos os efeitos praticos.
+    A conexao em si continua por conta da ponte; quando a leitura
     voltar, processar_leitura desmarca o offline sozinha.
     """
     while True:
@@ -651,13 +649,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-class Comando(BaseModel):
-    """Comando vindo do frontend. Os dois campos sao opcionais."""
-
-    potencia: Optional[int] = Field(default=None, ge=0, le=100)
-    motor: Optional[Literal["on", "off"]] = None
 
 
 @app.get("/status")
@@ -723,39 +714,6 @@ async def sessao_nova() -> dict[str, Any]:
     return {"ok": True, "leituras_descartadas": descartadas}
 
 
-@app.post("/comando")
-async def comando(comando: Comando) -> dict[str, Any]:
-    """Recebe o comando do frontend e repassa para o T-Beam.
-
-    O repasse vai pela MESMA conexao WebSocket ja aberta com a placa - por
-    isso o firmware aceita comandos por WebSocket (ver o comentario no topo
-    de firmware/src/main.cpp).
-    """
-    payload = comando.model_dump(exclude_none=True)
-    if not payload:
-        raise HTTPException(
-            status_code=422,
-            detail="Envie ao menos um campo: 'potencia' (0-100) ou 'motor' (on/off).",
-        )
-
-    if estado.offline or estado.conexao_tbeam is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"T-Beam offline ({TBEAM_URI}). Comando nao foi entregue.",
-        )
-
-    try:
-        await estado.conexao_tbeam.send(json.dumps(payload))
-    except Exception as erro:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Falha ao enviar comando para o T-Beam: {erro}",
-        ) from erro
-
-    log.info("Comando repassado ao T-Beam: %s", payload)
-    return {"ok": True, "enviado": payload}
-
-
 @app.websocket("/ws/temperatura")
 async def ws_temperatura(websocket: WebSocket) -> None:
     """WebSocket que o FRONTEND consome."""
@@ -769,7 +727,7 @@ async def ws_temperatura(websocket: WebSocket) -> None:
         await websocket.send_text(
             json.dumps({**montar_mensagem(), "historico": estado.historico})
         )
-        # Nao esperamos nada do frontend por aqui (comandos vao por POST),
+        # Nao esperamos nada do frontend por aqui,
         # mas mantemos a leitura viva para detectar a desconexao.
         while True:
             await websocket.receive_text()

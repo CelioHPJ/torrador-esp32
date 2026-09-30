@@ -4,7 +4,7 @@
 ============================================================================
 
  Sobe no PC um servidor WebSocket que fala EXATAMENTE o mesmo protocolo do
- firmware (mesmo JSON, mesma curva de temperatura, mesmos comandos), para
+ firmware (mesmo JSON, uma curva de torra inventada), para
  dar para validar a cadeia backend -> frontend sem ter a placa gravada,
  ligada ou na mesma rede.
 
@@ -38,10 +38,7 @@ INTERVALO_ENVIO_S = 1.0
 # saindo uma mensagem por segundo.
 INTERVALO_AMOSTRAGEM_S = 0.25
 
-# Mesmo estado que o firmware mantem em memoria.
 temperatura = TEMP_AMBIENTE
-potencia_atual = 100
-motor_ligado = False
 boot = time.monotonic()
 
 
@@ -51,10 +48,13 @@ FATOR_POR_AMOSTRA = 1.0 - (1.0 - FATOR_APROXIMACAO) ** INTERVALO_AMOSTRAGEM_S
 
 
 def ler_temperatura() -> float:
-    """Espelho da funcao lerTemperatura() do firmware. Uma amostra crua."""
+    """Uma amostra crua de uma torra inventada.
+
+    A pipoqueira nao tem controle de calor: esquenta sempre no maximo. Por
+    isso a curva so sobe rumo ao patamar, como numa torra de verdade nela.
+    """
     global temperatura
-    alvo = TEMP_AMBIENTE + (TEMP_MAX_TORRA - TEMP_AMBIENTE) * (potencia_atual / 100.0)
-    temperatura += (alvo - temperatura) * FATOR_POR_AMOSTRA
+    temperatura += (TEMP_MAX_TORRA - temperatura) * FATOR_POR_AMOSTRA
     # Ruido de MEDICAO: fora do estado, para que a media consiga atenua-lo.
     return temperatura + random.uniform(-0.15, 0.15)
 
@@ -77,29 +77,17 @@ async def transmitir(conexao) -> None:
         leitura = {
             "temp": round(media, 2),
             "timestamp": int((time.monotonic() - boot) * 1000),  # millis()
-            "potencia_atual": potencia_atual,
-            "motor_ligado": motor_ligado,
         }
         await conexao.send(json.dumps(leitura))
 
 
 async def atender(conexao) -> None:
-    global potencia_atual, motor_ligado
     print("[SIM] backend conectado")
     tarefa = asyncio.create_task(transmitir(conexao))
     try:
-        async for bruta in conexao:
-            try:
-                comando = json.loads(bruta)
-            except json.JSONDecodeError:
-                print("[SIM] JSON invalido:", bruta[:80])
-                continue
-            if "potencia" in comando:
-                potencia_atual = max(0, min(100, int(comando["potencia"])))
-                print(f"[SIM] potencia -> {potencia_atual}%")
-            if "motor" in comando:
-                motor_ligado = comando["motor"] == "on"
-                print(f"[SIM] motor -> {'ON' if motor_ligado else 'OFF'}")
+        # Nada chega do backend; o laco so serve para notar a desconexao.
+        async for _ in conexao:
+            pass
     finally:
         tarefa.cancel()
         print("[SIM] backend desconectado")

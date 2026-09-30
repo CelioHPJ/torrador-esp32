@@ -14,37 +14,40 @@
  *
  *  O QUE ELE TRANSMITE (1x por segundo, para todos os clientes conectados):
  *      {
- *        "temp":            23.7,     // float, graus Celsius
- *        "timestamp":       154320,   // millis() do ESP32
- *        "potencia_atual":  80,       // int 0-100
- *        "motor_ligado":    true      // bool
+ *        "temp":       23.7,     // float, graus C; null se o sensor falhou
+ *        "timestamp":  154320    // millis() do ESP32
  *      }
  *
- *  COMO ELE RECEBE COMANDOS  (as duas vias fazem exatamente a mesma coisa):
- *
- *    1) VIA PRINCIPAL - mensagem de texto JSON no MESMO WebSocket.
- *       E a via usada pelo backend, porque ele ja tem a conexao aberta:
- *       nao precisa abrir um socket HTTP novo a cada comando, nao precisa
- *       saber a porta HTTP separadamente e o comando chega na hora.
- *
- *    2) VIA DE CONVENIENCIA - HTTP POST /comando, para testar na unha com
- *       curl sem precisar de um cliente WebSocket. Mesmo corpo JSON.
- *
- *       Corpo aceito (os dois campos sao opcionais e independentes):
- *           { "potencia": 0..100 }
- *           { "motor": "on" | "off" }
- *           { "potencia": 75, "motor": "on" }
- *
- *  ATENCAO: NADA de hardware e acionado ainda. Comandos apenas atualizam as
- *  variaveis internas, que voltam refletidas na proxima leitura transmitida.
- *  O acionamento real (SSR da resistencia + motor de agitacao) entra depois.
+ *  SO MEDE, NAO ACIONA NADA. O torrador e uma pipoqueira eletrica de ar
+ *  quente, ligada direto na tomada; a placa nao controla a resistencia nem
+ *  a ventoinha, e por isso nao recebe comando nenhum.
  * ========================================================================== */
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
+#include <SPI.h>
+#include <Adafruit_MAX31855.h>
+
+/* ------------------------------------------------------------------------ */
+/*  TERMOPAR (MAX31855 + tipo K)                                             */
+/* ------------------------------------------------------------------------ */
+/*  OS MESMOS PINOS DE firmware/teste_termopar, onde a fiacao foi provada.   */
+/*  Mudar aqui sem mudar la joga fora a unica coisa que aquele teste provou. */
+/*                                                                           */
+/*  NAO USE O GPIO 12 PARA O DO: e pino de strapping (lido no boot, pode     */
+/*  impedir a placa de ligar) e no T-Beam ainda e usado pelo GPS. Evite      */
+/*  tambem 0, 2 e 15, e os pinos de LoRa/GPS/AXP192.                         */
+/* ------------------------------------------------------------------------ */
+#define PINO_MAX_CLK 13
+#define PINO_MAX_CS  14
+#define PINO_MAX_DO  25
+
+// SPI por software: (clock, chip select, data out)
+Adafruit_MAX31855 termopar(PINO_MAX_CLK, PINO_MAX_CS, PINO_MAX_DO);
 
 /* ------------------------------------------------------------------------ */
 /*  CREDENCIAIS DA REDE                                                      */
@@ -64,7 +67,14 @@
   #error "Falta include/credenciais.h -- copie de include/credenciais.exemplo.h e preencha."
 #endif
 
+
 const uint16_t PORTA_HTTP        = 80;     // servidor HTTP + WebSocket
+
+// Nome da placa na rede. Vira "torrador.local" por mDNS, e e tambem o nome
+// que aparece na lista de aparelhos conectados do roteador/celular. Existe
+// para a placa poder rodar LONGE do USB: sem a serial ninguem ve o IP que o
+// DHCP deu, e o nome continua o mesmo quando o IP muda.
+const char    *NOME_NA_REDE      = "torrador";
 const char    *CAMINHO_WEBSOCKET = "/ws";  // ws://<ip-do-tbeam>/ws
 const uint32_t INTERVALO_ENVIO_MS = 1000;  // periodo de transmissao (1 s)
 
@@ -74,14 +84,6 @@ const uint32_t INTERVALO_ENVIO_MS = 1000;  // periodo de transmissao (1 s)
 // o tamanho da serie no grafico nem o custo de render do frontend.
 // 250 ms respeita com folga o tempo de conversao do MAX31855 (~100 ms).
 const uint32_t INTERVALO_AMOSTRAGEM_MS = 250;   // 4 amostras por envio
-
-/* ------------------------------------------------------------------------ */
-/*  ESTADO DA TORRA (o "modelo" que a placa mantem em memoria)               */
-/* ------------------------------------------------------------------------ */
-int  potenciaAtual = 100;    // 0-100. Comeca em 100 para que a curva suba
-                             // sozinha assim que a placa liga e da para
-                             // validar a cadeia inteira sem mandar comando.
-bool motorLigado   = false;  // desligado ate alguem mandar {"motor":"on"}
 
 AsyncWebServer servidor(PORTA_HTTP);
 AsyncWebSocket ws(CAMINHO_WEBSOCKET);
@@ -107,146 +109,49 @@ uint32_t ultimaTentativaWiFi = 0;
 uint32_t ultimoAvisoOffline  = 0;
 bool     estavaConectado     = false;
 
-/* ==========================================================================
- *  #############   ATENCAO - PONTO DE TROCA DO SENSOR   ####################
- * ==========================================================================
- *
- *      ESTA E A UNICA FUNCAO QUE SERA SUBSTITUIDA QUANDO O MODULO
- *      MAX31855 (+ termopar tipo K) CHEGAR FISICAMENTE.
- *
- *  Hoje ela devolve um valor SIMULADO. Amanha ela devolve a leitura real
- *  via SPI usando a biblioteca "Adafruit MAX31855". A troca e pontual:
- *
- *      NENHUMA outra parte deste arquivo precisa mudar.
- *      - conexao Wi-Fi:            nao muda
- *      - servidor WebSocket:       nao muda
- *      - tratamento de comandos:   nao muda
- *      - formato do JSON enviado:  nao muda
- *      - backend e frontend:       nao mudam
- *
- *  ---------------------------------------------------------------------
- *  COMO SERA A SUBSTITUICAO (passo a passo, quando o modulo chegar):
- *
- *    1) platformio.ini -> descomente:
- *           adafruit/Adafruit MAX31855 library @ ^1.4.2
- *
- *    2) No topo deste arquivo:
- *           #include <SPI.h>
- *           #include <Adafruit_MAX31855.h>
- *           #define PINO_MAX_CLK  13
- *           #define PINO_MAX_CS   14
- *           #define PINO_MAX_DO   25
- *           Adafruit_MAX31855 termopar(PINO_MAX_CLK, PINO_MAX_CS, PINO_MAX_DO);
- *
- *       USE EXATAMENTE OS MESMOS PINOS DE firmware/teste_termopar, que sao
- *       os acima. Se o teste isolado passou com uma fiacao, integrar com
- *       outra joga fora a unica coisa que aquele teste provou.
- *
- *       EM ESPECIAL, NAO USE O GPIO 12 PARA O DO. Este comentario ja mandou
- *       usar 12 e estava errado em dois sentidos: 12 e pino de strapping
- *       (lido durante o boot, pode impedir a placa de ligar) e no T-Beam ele
- *       ainda e usado pelo GPS. O erro so apareceria DEPOIS da integracao,
- *       com o sensor ja provado funcionando -- e a culpa cairia na integracao.
- *
- *       (varios pinos do T-Beam ja sao usados por LoRa/GPS/AXP192 mesmo sem
- *        usarmos esses perifericos nesta fase; evite tambem GPIO 0, 2 e 15)
- *
- *    3) Dentro de setup(), antes de conectarWiFi():
- *           termopar.begin();
- *
- *    4) Troque TODO o corpo desta funcao por:
- *           double c = termopar.readCelsius();
- *           if (isnan(c)) {              // termopar solto / falha de leitura
- *               return temperaturaAtual; // repete o ultimo valor valido
- *           }
- *           temperaturaAtual = (float) c;
- *           return temperaturaAtual;
- *
- *       OBS: esta funcao agora e chamada a cada INTERVALO_AMOSTRAGEM_MS
- *       (250 ms) e o que vai para a rede e a MEDIA das amostras do segundo
- *       - ver amostrarTemperatura() / temperaturaMedia() mais abaixo. Nao ha
- *       nada a fazer para isso funcionar: basta a funcao devolver UMA leitura
- *       crua por chamada. O tratamento de isnan acima ja evita que uma falha
- *       de leitura envenene a media.
- *
- *  ---------------------------------------------------------------------
- *  COMO A SIMULACAO ATUAL FUNCIONA:
- *
- *  Aproximacao assintotica (resfriamento/aquecimento de Newton simplificado),
- *  chamada uma vez por AMOSTRA (4x por ciclo de transmissao):
- *
- *      temperatura += (alvo - temperatura) * FATOR_APROXIMACAO;
- *
- *  Isso da exatamente o formato de uma torra real: sobe rapido no comeco
- *  (diferenca grande para o alvo), vai desacelerando conforme se aproxima
- *  e estabiliza no patamar como se estivesse em equilibrio termico.
- *  O alvo depende da potencia, entao mexer no slider do frontend muda a
- *  curva de verdade: potencia 100 -> ~215 C; potencia 0 -> volta ao ambiente.
- * ========================================================================== */
+/* ------------------------------------------------------------------------ */
+/*  LEITURA DO SENSOR                                                        */
+/* ------------------------------------------------------------------------ */
+uint32_t totalFalhasSensor = 0;
+uint32_t ultimoAvisoSensor = 0;
+const uint32_t INTERVALO_AVISO_SENSOR_MS = 5000;
+
+// Uma leitura crua do termopar, em C. Devolve NAN quando a leitura nao vale.
+//
+// NA FALHA NAO SE REPETE O ULTIMO VALOR BOM. Com o termopar soltando no meio
+// da torra, repetir o ultimo valor manteria a tela mostrando, digamos, 185 C
+// parados -- com cara de medida, enquanto o cafe continua esquentando. NAN
+// vira "temp": null na rede, e o backend ja descarta isso com aviso.
 float lerTemperatura()
 {
-    const float TEMP_AMBIENTE      = 25.0f;   // ponto de partida
-    const float TEMP_MAX_TORRA     = 215.0f;  // patamar com potencia 100%
+    double celsius = termopar.readCelsius();
+    double interna = termopar.readInternal();
 
-    // Esta funcao passou a ser chamada a cada INTERVALO_AMOSTRAGEM_MS, e nao
-    // mais uma vez por segundo - entao o fator precisa ser POR AMOSTRA, senao
-    // a curva simulada subiria 4x mais rapido. Derivado do fator por segundo
-    // (0.05 -> ~20 s de constante de tempo):
-    //     f_amostra = 1 - (1 - f_segundo) ^ (intervalo_amostra / 1 s)
-    // Assim o formato da curva fica identico a qualquer taxa de amostragem e
-    // continua batendo com o simulador em backend/simulador_tbeam.py.
-    static const float FATOR_APROXIMACAO =
-        1.0f - powf(1.0f - 0.05f, INTERVALO_AMOSTRAGEM_MS / 1000.0f);
-
-    static float temperaturaAtual = TEMP_AMBIENTE;
-
-    // Alvo proporcional a potencia comandada.
-    float alvo = TEMP_AMBIENTE +
-                 (TEMP_MAX_TORRA - TEMP_AMBIENTE) * (potenciaAtual / 100.0f);
-
-    temperaturaAtual += (alvo - temperaturaAtual) * FATOR_APROXIMACAO;
-
-    // Ruido de MEDICAO: +-0.15 C aplicado apenas ao valor RETORNADO, nunca
-    // acumulado em temperaturaAtual. A distincao importa agora que existe
-    // superamostragem: somado ao estado o ruido viraria um passeio aleatorio
-    // (deriva permanente, que media nenhuma remove); fora do estado ele e
-    // exatamente o tipo de ruido que a media das amostras atenua.
-    return temperaturaAtual + (random(-15, 16) / 100.0f);
-}
-/* ======================  FIM DO PONTO DE TROCA  ========================== */
-
-/* ------------------------------------------------------------------------ */
-/*  COMANDOS                                                                 */
-/* ------------------------------------------------------------------------ */
-
-// Aplica um comando JSON ja parseado. Usada tanto pelo WebSocket quanto
-// pela rota HTTP POST /comando - as duas vias caem aqui.
-void aplicarComando(const JsonDocument &comando)
-{
-    if (comando["potencia"].is<int>()) {
-        int p = comando["potencia"].as<int>();
-        potenciaAtual = constrain(p, 0, 100);
-        Serial.printf("[CMD] potencia -> %d%%\n", potenciaAtual);
+    const char *motivo = nullptr;
+    if (isnan(celsius)) {
+        uint8_t erro = termopar.readError();
+        if      (erro & MAX31855_FAULT_OPEN)      motivo = "termopar aberto (solto / fio partido)";
+        else if (erro & MAX31855_FAULT_SHORT_GND) motivo = "termopar em curto com o GND";
+        else if (erro & MAX31855_FAULT_SHORT_VCC) motivo = "termopar em curto com o VCC";
+        else                                      motivo = "leitura invalida";
+    } else if (celsius == 0.0 && interna == 0.0) {
+        // 32 bits zerados: e o DO sem sinal, nao 0 grau. A junta fria mede o
+        // proprio chip e nunca marca 0,00 numa bancada. Ver teste_termopar.
+        motivo = "SEM COMUNICACAO COM O CHIP (32 bits zerados) - confira DO no GPIO 25";
     }
 
-    if (comando["motor"].is<const char *>()) {
-        const char *m = comando["motor"];
-        motorLigado = (strcmp(m, "on") == 0);
-        Serial.printf("[CMD] motor -> %s\n", motorLigado ? "ON" : "OFF");
+    if (motivo == nullptr) {
+        return (float) celsius;
     }
-}
 
-// Faz o parse de um payload cru e aplica. Retorna false se o JSON for invalido.
-bool tratarPayloadComando(const uint8_t *dados, size_t tamanho)
-{
-    JsonDocument comando;
-    DeserializationError erro = deserializeJson(comando, dados, tamanho);
-    if (erro) {
-        Serial.printf("[CMD] JSON invalido: %s\n", erro.c_str());
-        return false;
+    totalFalhasSensor++;
+    uint32_t agora = millis();
+    if (agora - ultimoAvisoSensor >= INTERVALO_AVISO_SENSOR_MS) {
+        ultimoAvisoSensor = agora;
+        Serial.printf("[SENSOR] %s | junta fria %.2f C | falhas ate agora: %lu\n",
+                      motivo, interna, totalFalhasSensor);
     }
-    aplicarComando(comando);
-    return true;
+    return NAN;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -257,16 +162,23 @@ double   somaAmostras = 0.0;
 uint16_t qtdAmostras  = 0;
 
 // Chamada pelo loop() a cada INTERVALO_AMOSTRAGEM_MS. So acumula, nao envia.
+// Amostra que falhou fica FORA da media: uma so leitura invalida envenenaria
+// o segundo inteiro.
 void amostrarTemperatura()
 {
-    somaAmostras += lerTemperatura();
+    float c = lerTemperatura();
+    if (isnan(c)) {
+        return;
+    }
+    somaAmostras += c;
     qtdAmostras++;
 }
 
-// Media das amostras desde o ultimo envio; zera o acumulador para o proximo.
+// Media das amostras validas desde o ultimo envio; zera o acumulador para o
+// proximo. NAN se nenhuma amostra do intervalo prestou.
 float temperaturaMedia()
 {
-    if (qtdAmostras == 0) {       // nenhuma amostra no intervalo: le direto
+    if (qtdAmostras == 0) {       // nenhuma amostra valida: tenta ler direto
         return lerTemperatura();
     }
     float media  = (float) (somaAmostras / qtdAmostras);
@@ -281,12 +193,15 @@ float temperaturaMedia()
 void transmitirLeitura()
 {
     JsonDocument leitura;
-    leitura["temp"]           = temperaturaMedia();  // media das amostras
-    leitura["timestamp"]      = millis();
-    leitura["potencia_atual"] = potenciaAtual;
-    leitura["motor_ligado"]   = motorLigado;
+    float media = temperaturaMedia();
+    if (isnan(media)) {
+        leitura["temp"] = nullptr;  // sensor falhou o segundo inteiro
+    } else {
+        leitura["temp"] = media;    // media das amostras validas
+    }
+    leitura["timestamp"] = millis();
 
-    char buffer[192];
+    char buffer[96];
     size_t n = serializeJson(leitura, buffer, sizeof(buffer));
     ws.textAll(buffer, n);
 }
@@ -307,16 +222,6 @@ void aoEventoWebSocket(AsyncWebSocket *servidorWs, AsyncWebSocketClient *cliente
         Serial.printf("[WS] cliente #%u desconectado\n", cliente->id());
         break;
 
-    case WS_EVT_DATA: {
-        AwsFrameInfo *info = (AwsFrameInfo *)arg;
-        // So tratamos frames de texto completos - comandos sao pequenos.
-        if (info->final && info->index == 0 && info->len == tamanho &&
-            info->opcode == WS_TEXT) {
-            tratarPayloadComando(dados, tamanho);
-        }
-        break;
-    }
-
     default:
         break;
     }
@@ -335,9 +240,8 @@ void anunciarRede()
     Serial.println(WiFi.localIP());
     Serial.printf ("[WIFI] WebSocket:    ws://%s%s\n",
                    WiFi.localIP().toString().c_str(), CAMINHO_WEBSOCKET);
-    Serial.printf ("[WIFI] HTTP comando: http://%s/comando\n",
-                   WiFi.localIP().toString().c_str());
-    Serial.println("       ^^^ anote este IP: e o TBEAM_HOST do backend ^^^");
+    Serial.printf ("[WIFI] pelo nome:    http://%s.local/\n", NOME_NA_REDE);
+    Serial.println("       ^^^ o IP (ou o nome, onde .local resolver) e o TBEAM_HOST ^^^");
 }
 
 // Tenta conectar por no maximo LIMITE_CONEXAO_MS. Devolve se conseguiu.
@@ -346,6 +250,7 @@ bool conectarWiFi()
 {
     Serial.printf("[WIFI] conectando em \"%s\"", WIFI_SSID);
     WiFi.mode(WIFI_STA);
+    WiFi.setHostname(NOME_NA_REDE);       // antes do begin(), ou o DHCP nao leva
     WiFi.setSleep(false);                 // evita latencia no WebSocket
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -378,12 +283,26 @@ void setup()
 {
     Serial.begin(115200);
     delay(300);
-    Serial.println("\n\n=== Torrador de Cafe - T-Beam (temperatura SIMULADA) ===");
+    Serial.println("\n\n=== Torrador de Cafe - T-Beam (termopar MAX31855) ===");
 
-    randomSeed(esp_random());
+    // begin() so configura os pinos, nao conversa com o chip: "ok" aqui nao
+    // prova fiacao. Quem acusa o modulo mudo e lerTemperatura().
+    termopar.begin();
+    delay(500);   // o chip precisa de um instante apos energizar
+    Serial.printf("[SENSOR] MAX31855 em CLK=%d CS=%d DO=%d | primeira leitura: %.2f C\n",
+                  PINO_MAX_CLK, PINO_MAX_CS, PINO_MAX_DO, lerTemperatura());
     // O resultado nao decide se o setup() continua: o servidor e o WebSocket
     // sao montados de qualquer jeito, prontos para quando a rede aparecer.
     estavaConectado = conectarWiFi();
+
+    // Sobe mesmo sem rede: o mDNS acompanha a interface sozinho e passa a
+    // responder quando o Wi-Fi conectar ou reconectar.
+    if (MDNS.begin(NOME_NA_REDE)) {
+        MDNS.addService("http", "tcp", PORTA_HTTP);
+        Serial.printf("[MDNS] respondendo como %s.local\n", NOME_NA_REDE);
+    } else {
+        Serial.println("[MDNS] falhou - use o IP");
+    }
 
     ws.onEvent(aoEventoWebSocket);
     servidor.addHandler(&ws);
@@ -391,25 +310,8 @@ void setup()
     // Rota de sanidade: abra http://<ip>/ no navegador para ver se esta vivo.
     servidor.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
         req->send(200, "text/plain",
-                  "T-Beam torrador ok. WebSocket em /ws, comandos em POST /comando");
+                  "T-Beam torrador ok. Leituras no WebSocket em /ws");
     });
-
-    // VIA DE CONVENIENCIA: POST /comando com o mesmo JSON aceito no WebSocket.
-    //   curl -X POST http://<ip>/comando -H "Content-Type: application/json" \
-    //        -d '{"potencia":50,"motor":"on"}'
-    servidor.on(
-        "/comando", HTTP_POST,
-        [](AsyncWebServerRequest *req) { /* resposta sai no handler de corpo */ },
-        NULL,
-        [](AsyncWebServerRequest *req, uint8_t *dados, size_t tamanho,
-           size_t indice, size_t total) {
-            if (tratarPayloadComando(dados, tamanho)) {
-                req->send(200, "application/json", "{\"ok\":true}");
-            } else {
-                req->send(400, "application/json",
-                          "{\"ok\":false,\"erro\":\"json invalido\"}");
-            }
-        });
 
     servidor.begin();
     Serial.println("[HTTP] servidor iniciado");

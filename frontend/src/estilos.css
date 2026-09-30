@@ -5,13 +5,13 @@
  *  a torra: papel, tinta, linhas finas. Nada de card com sombra.
  *
  *  REGRA TIPOGRAFICA DO SISTEMA (vale para a tela inteira):
- *      serifada (Fraunces) = VALORES MEDIDOS  -> temperatura, potencia, motor
- *      sans     (Inter)    = INTERFACE        -> rotulos, botoes, eixos, avisos
- *  Numero medido nunca aparece em sans; botao ou rotulo nunca em serifada.
+ *      serifada (Fraunces) = VALORES MEDIDOS  -> temperatura, Agtron, leituras
+ *      sans     (Inter)    = INTERFACE        -> rotulos, eixos, avisos
+ *  Numero medido nunca aparece em sans; rotulo nunca em serifada.
  *
  *  REGRA DE COR:
- *      O terracota e a UNICA cor de destaque e aparece em exatamente tres
- *      lugares: a temperatura atual, o estado "ligado" e a linha do grafico.
+ *      O terracota e a UNICA cor de destaque e aparece em exatamente dois
+ *      lugares: a temperatura atual e a linha do grafico.
  *      Vermelho e oliva sao semanticos (falha / tudo certo), nao decoracao.
  *
  *  LAYOUT (painel, nao documento):
@@ -25,8 +25,6 @@
  *          |  status          |  eixos para ocupar a sobra)  | 1fr
  *          |  temperatura     |                              |
  *          |  campos          |                              |
- *          |  --------------  |                              |
- *          |  comandos (base) |                              |
  *          +------------------+------------------------------+
  *              minmax(340px, 30rem)          1fr
  *
@@ -131,15 +129,6 @@ body {
   min-height: 0;
 }
 
-/* Os comandos ficam ancorados na base da coluna. O respiro que sobra entre
-   os numeros e os controles e proposital: separa "o que esta acontecendo"
-   de "o que eu posso fazer", e mantem os botoes sempre no mesmo lugar da
-   tela durante a torra. */
-.comandos {
-  padding-top: var(--e4);
-  border-top: 1px solid var(--linha);
-}
-
 /* ==========================================================================
  *  Cabecalho
  * ========================================================================== */
@@ -175,8 +164,8 @@ body {
   color: var(--ink);
 }
 
-/* A cor semantica fica so no ponto: o terracota e reservado a leitura, ao
-   motor ligado e a linha do grafico. Estado nunca compete com valor. */
+/* A cor semantica fica so no ponto: o terracota e reservado a leitura e a
+   linha do grafico. Estado nunca compete com valor. */
 .status--ok .ponto      { color: var(--oliva); }
 .status--offline .ponto { color: var(--oxblood); }
 .status--morto .ponto   { color: var(--oxblood); }
@@ -262,7 +251,7 @@ body {
 
 /* --- Agtron estimado: segundo valor de destaque, um degrau abaixo do hero -
    Em tinta, nao em terracota: o destaque colorido continua reservado a
-   temperatura, ao motor ligado e a linha do grafico. */
+   temperatura e a linha do grafico. */
 .valor-medio {
   display: flex;
   align-items: baseline;
@@ -296,7 +285,7 @@ body {
   color: var(--ink-suave);
 }
 
-/* --- campos secundarios: tres colunas dentro da coluna de leitura ------- */
+/* --- campos secundarios: grade dentro da coluna de leitura -------------- */
 .campos {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -317,7 +306,6 @@ body {
   font-size: 0.68em;
   color: var(--ink-suave);
 }
-.campo-valor.ligado { color: var(--terracota); }
 .campo-valor.vazio { color: var(--linha-forte); }
 
 /* ==========================================================================
@@ -365,96 +353,11 @@ body {
 }
 
 /* ==========================================================================
- *  Comandos
- * ========================================================================== */
-.linha-comando {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--e2) var(--e3);
-}
-.linha-comando + .linha-comando { margin-top: var(--e3); }
-
-.linha-comando > .rotulo {
-  width: 62px;
-  flex: none;
-}
-
-.deslizante {
-  flex: 1 1 120px;
-  min-width: 0;
-  accent-color: var(--terracota);
-  height: 22px;
-  cursor: pointer;
-}
-.deslizante:disabled { cursor: not-allowed; opacity: 0.45; }
-
-.entrada {
-  width: 66px;
-  flex: none;
-  padding: 7px 9px;
-  font-family: var(--sans);
-  font-size: 0.9375rem;
-  font-variant-numeric: tabular-nums;
-  color: var(--ink);
-  background: var(--papel);
-  border: 1px solid var(--linha-forte);
-  border-radius: 2px;
-  transition: border-color 160ms var(--saida);
-}
-.entrada:hover:not(:disabled) { border-color: var(--ink-suave); }
-.entrada:focus-visible {
-  outline: 2px solid var(--terracota);
-  outline-offset: 1px;
-  border-color: var(--terracota);
-}
-.entrada:disabled { opacity: 0.45; cursor: not-allowed; }
-
-.botao {
-  padding: 7px 15px;
-  font-family: var(--sans);
-  font-size: 0.9375rem;
-  font-weight: 500;
-  color: var(--ink);
-  background: transparent;
-  border: 1px solid var(--linha-forte);
-  border-radius: 2px;
-  cursor: pointer;
-  transition: background-color 160ms var(--saida), border-color 160ms var(--saida);
-}
-.botao:hover:not(:disabled) { background: var(--terracota-tenue); border-color: var(--terracota); }
-.botao:active:not(:disabled) { background: rgba(169, 80, 47, 0.18); }
-.botao:focus-visible { outline: 2px solid var(--terracota); outline-offset: 2px; }
-.botao:disabled { opacity: 0.4; cursor: not-allowed; }
-
-.botao--forte {
-  color: var(--papel);
-  background: var(--ink);
-  border-color: var(--ink);
-}
-.botao--forte:hover:not(:disabled) { background: #453a32; border-color: #453a32; }
-.botao--forte:active:not(:disabled) { background: #241e1a; }
-
-.retorno {
-  margin: var(--e3) 0 0;
-  min-height: 1.4em;
-  font-size: 0.8125rem;
-  color: var(--ink-suave);
-}
-.retorno.falhou { color: var(--oxblood); }
-
-.nota {
-  margin: var(--e2) 0 0;
-  font-size: 0.8125rem;
-  color: var(--ink-suave);
-}
-
-/* ==========================================================================
  *  Notebook de tela baixa (1366x768 e parecidos)
  *
  *  O painel precisa caber INTEIRO na viewport no dia da apresentacao. Aqui a
  *  regra e por ALTURA, nao por largura: encolhe o respiro e o numero hero o
- *  suficiente para os comandos nao cairem para fora da tela. Em monitor alto
+ *  suficiente para a coluna de leitura nao cair para fora da tela. Em monitor alto
  *  nada disso se aplica e o hero volta ao tamanho cheio.
  * ========================================================================== */
 @media (min-width: 901px) and (max-height: 880px) {
@@ -466,7 +369,6 @@ body {
   .campos { margin-top: var(--e4); }
   .termometro { margin-top: var(--e1); }
   .regua { margin-top: var(--e2); }
-  .comandos { padding-top: var(--e3); }
   .secao-titulo { margin-bottom: var(--e2); }
   .cabecalho { padding-top: var(--e2); padding-bottom: var(--e2); }
 }
@@ -488,14 +390,12 @@ body {
     border-bottom: 1px solid var(--linha);
     overflow-y: visible;
   }
-  .comandos { margin-top: var(--e5); }
   .grafico,
   .grafico-vazio { min-height: 300px; }
 }
 
 @media (max-width: 480px) {
   .campos { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .linha-comando > .rotulo { width: 100%; }
 }
 
 /* ==========================================================================

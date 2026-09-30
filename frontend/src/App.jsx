@@ -1,10 +1,10 @@
 /* ==========================================================================
  *  Painel do torrador - "caderno de torra"
  *
- *  Painel de tela cheia para acompanhar a torra ao vivo: leitura e comandos
- *  na coluna da esquerda, curva ocupando todo o resto. A logica de conexao
- *  (WebSocket, reconexao, comandos) e a mesma desde a primeira versao; o
- *  tratamento visual esta em estilos.css.
+ *  Painel de tela cheia para acompanhar a torra ao vivo: leitura na coluna
+ *  da esquerda, curva ocupando todo o resto. So acompanha, nao comanda: a
+ *  pipoqueira nao e acionada pela placa, entao nao ha o que comandar daqui.
+ *  O tratamento visual esta em estilos.css.
  * ========================================================================== */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
@@ -16,7 +16,6 @@ import './estilos.css'
 // Endereco do BACKEND (nunca do T-Beam).
 const BACKEND = import.meta.env.VITE_BACKEND_HOST || 'localhost:8000'
 const URL_WS = `ws://${BACKEND}/ws/temperatura`
-const URL_COMANDO = `http://${BACKEND}/comando`
 
 const MAX_PONTOS = 1800 // ~30 min a 1 leitura/s
 
@@ -55,14 +54,8 @@ export default function App() {
   const [pontos, setPontos] = useState([])          // serie do grafico
   const [offline, setOffline] = useState(true)      // T-Beam fora do ar?
   const [backendOk, setBackendOk] = useState(false) // WebSocket do backend vivo?
-  const [potencia, setPotencia] = useState(100)
-  const [retorno, setRetorno] = useState(null)      // { texto, falhou }
 
   const tZeroRef = useRef(null) // instante da primeira leitura, vira o "0 s"
-  // Enquanto o usuario nao encostou no controle, o slider acompanha o valor
-  // que a placa reporta. Depois disso ele para de ser sobrescrito - senao a
-  // leitura que chega a cada segundo apagaria o que voce esta digitando.
-  const usuarioMexeuRef = useRef(false)
 
   // ---- normaliza uma leitura crua do backend em um ponto do grafico ------
   // Usamos "recebido_em" (relogio real do backend) e nao o "timestamp" da
@@ -111,9 +104,6 @@ export default function App() {
         if (msg.tipo === 'tick') return
 
         if (msg.temp != null) setLeitura(msg)
-        if (msg.potencia_atual != null && !usuarioMexeuRef.current) {
-          setPotencia(msg.potencia_atual)
-        }
 
         // A primeira mensagem traz o historico da sessao: o grafico ja nasce
         // com a curva inteira em vez de comecar vazio.
@@ -149,32 +139,6 @@ export default function App() {
     }
   }, [paraPonto])
 
-  // A partir do primeiro ajuste manual, o slider passa a ser do usuario.
-  const ajustarPotencia = (valor) => {
-    usuarioMexeuRef.current = true
-    setPotencia(Number(valor))
-  }
-
-  // ---- envio de comandos (POST /comando no backend) ----------------------
-  const enviarComando = async (corpo, descricao) => {
-    setRetorno({ texto: 'enviando…', falhou: false })
-    try {
-      const resposta = await fetch(URL_COMANDO, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(corpo),
-      })
-      const dados = await resposta.json()
-      setRetorno(
-        resposta.ok
-          ? { texto: `${descricao} — registrado no T-Beam.`, falhou: false }
-          : { texto: dados.detail ?? `falhou (erro ${resposta.status}).`, falhou: true },
-      )
-    } catch (erro) {
-      setRetorno({ texto: `sem resposta do backend: ${erro.message}`, falhou: true })
-    }
-  }
-
   // ---- estado da cadeia --------------------------------------------------
   const cadeia = !backendOk ? 'morto' : offline ? 'offline' : 'ok'
   const textoCadeia = {
@@ -183,7 +147,6 @@ export default function App() {
     morto: ['backend fora do ar', `sem conexão com ${URL_WS}`],
   }[cadeia]
 
-  const podeComandar = backendOk && !offline
   const temp = leitura?.temp
   const agtron = leitura?.agtron_estimado
   const preenchimento = temp == null
@@ -200,8 +163,8 @@ export default function App() {
       </header>
 
       <div className="corpo">
-        {/* ================= coluna de leitura + comandos ================= */}
-        <section className="coluna-leitura" aria-label="Leitura e comandos">
+        {/* ======================= coluna de leitura ====================== */}
+        <section className="coluna-leitura" aria-label="Leitura">
           <p className={`status status--${cadeia}`} role="status">
             <span className="ponto" aria-hidden="true" />
             <span>
@@ -247,85 +210,11 @@ export default function App() {
 
           <div className="campos">
             <div>
-              <span className="rotulo">potência</span>
-              <div className={`campo-valor${leitura?.potencia_atual == null ? ' vazio' : ''}`}>
-                {leitura?.potencia_atual ?? '—'}
-                <span className="sufixo"> %</span>
-              </div>
-            </div>
-            <div>
-              <span className="rotulo">motor</span>
-              <div
-                className={`campo-valor${leitura?.motor_ligado ? ' ligado' : ''}${
-                  leitura?.motor_ligado == null ? ' vazio' : ''
-                }`}
-              >
-                {leitura?.motor_ligado == null ? '—' : leitura.motor_ligado ? 'ligado' : 'desligado'}
-              </div>
-            </div>
-            <div>
               <span className="rotulo">leituras</span>
               <div className={`campo-valor${pontos.length === 0 ? ' vazio' : ''}`}>
                 {pontos.length || '—'}
               </div>
             </div>
-          </div>
-
-          <div className="comandos">
-            <h2 className="secao-titulo">Comandos</h2>
-
-            <div className="linha-comando">
-              <label className="rotulo" htmlFor="potencia">potência</label>
-              <input
-                id="potencia"
-                className="deslizante"
-                type="range" min="0" max="100" value={potencia}
-                disabled={!podeComandar}
-                onChange={(e) => ajustarPotencia(e.target.value)}
-              />
-              <input
-                className="entrada"
-                type="number" min="0" max="100" value={potencia}
-                disabled={!podeComandar}
-                aria-label="potência em porcentagem"
-                onChange={(e) => ajustarPotencia(e.target.value)}
-              />
-              <button
-                className="botao botao--forte"
-                disabled={!podeComandar}
-                onClick={() => enviarComando({ potencia }, `potência ${potencia}%`)}
-              >
-                registrar
-              </button>
-            </div>
-
-            <div className="linha-comando">
-              <span className="rotulo">motor</span>
-              <button
-                className="botao"
-                disabled={!podeComandar}
-                onClick={() => enviarComando({ motor: 'on' }, 'motor ligado')}
-              >
-                ligar
-              </button>
-              <button
-                className="botao"
-                disabled={!podeComandar}
-                onClick={() => enviarComando({ motor: 'off' }, 'motor desligado')}
-              >
-                desligar
-              </button>
-            </div>
-
-            <p className={`retorno${retorno?.falhou ? ' falhou' : ''}`} aria-live="polite">
-              {retorno?.texto}
-            </p>
-
-            {!podeComandar && (
-              <p className="nota">
-                comandos indisponíveis enquanto a cadeia não estiver completa.
-              </p>
-            )}
           </div>
         </section>
 
