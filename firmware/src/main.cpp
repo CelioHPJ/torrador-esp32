@@ -76,12 +76,23 @@ Adafruit_MAX31855 termopar(PINO_MAX_CLK, PINO_MAX_CS, PINO_MAX_DO);
 #endif
 
 // Redes conhecidas, na ordem de preferencia. A segunda e opcional: existe
-// para a placa ir e voltar entre a casa e o hotspot do celular SEM REGRAVAR.
-struct Rede { const char *ssid; const char *senha; };
+// para a placa ir e voltar entre a casa e um hotspot (notebook ou celular)
+// SEM REGRAVAR.
+//
+// ipFixo: nullptr = pega IP por DHCP. Com IP fixo, o gateway e o DNS sao o
+// .1 da mesma faixa /24 -- que e o caso do hotspot do Windows (192.168.137.1).
+// Existe porque no hotspot o computador so alcanca a placa por um repasse
+// (netsh portproxy) amarrado ao IP dela; com DHCP, IP novo quebrava o repasse.
+struct Rede { const char *ssid; const char *senha; const char *ipFixo; };
+
+#if defined(WIFI_SSID_2) && !defined(WIFI_IP_2)
+  #define WIFI_IP_2 nullptr
+#endif
+
 const Rede REDES[] = {
-    { WIFI_SSID,   WIFI_PASSWORD   },
+    { WIFI_SSID,   WIFI_PASSWORD,   nullptr   },
 #ifdef WIFI_SSID_2
-    { WIFI_SSID_2, WIFI_PASSWORD_2 },
+    { WIFI_SSID_2, WIFI_PASSWORD_2, WIFI_IP_2 },
 #endif
 };
 const size_t QTD_REDES = sizeof(REDES) / sizeof(REDES[0]);
@@ -294,6 +305,21 @@ void anunciarRede()
     Serial.println("       ^^^ o IP (ou o nome, onde .local resolver) e o TBEAM_HOST ^^^");
 }
 
+// Comeca a conectar na rede REDES[i], com IP fixo ou DHCP conforme ela pedir.
+// A config vale ate a proxima chamada: sem voltar ao DHCP aqui, o IP fixo de
+// uma rede vazaria para a outra na alternancia do loop.
+void iniciarRede(size_t i)
+{
+    IPAddress ip;
+    if (REDES[i].ipFixo != nullptr && ip.fromString(REDES[i].ipFixo)) {
+        IPAddress gateway(ip[0], ip[1], ip[2], 1);
+        WiFi.config(ip, gateway, IPAddress(255, 255, 255, 0), gateway);
+    } else {
+        WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);   // volta ao DHCP
+    }
+    WiFi.begin(REDES[i].ssid, REDES[i].senha);
+}
+
 // Tenta cada rede de REDES por no maximo LIMITE_CONEXAO_MS. Devolve se
 // conseguiu. NAO trava esperando: quem chama segue a vida de qualquer jeito.
 //
@@ -308,7 +334,7 @@ bool conectarWiFi()
 
     for (redeAtual = 0; redeAtual < QTD_REDES; redeAtual++) {
         Serial.printf("[WIFI] conectando em \"%s\"", REDES[redeAtual].ssid);
-        WiFi.begin(REDES[redeAtual].ssid, REDES[redeAtual].senha);
+        iniciarRede(redeAtual);
 
         uint32_t comeco = millis();
         while (WiFi.status() != WL_CONNECTED &&
@@ -459,7 +485,7 @@ void loop()
             redeAtual = (redeAtual + 1) % QTD_REDES;
             Serial.printf("[WIFI] sem rede - tentando \"%s\"...\n",
                           REDES[redeAtual].ssid);
-            WiFi.begin(REDES[redeAtual].ssid, REDES[redeAtual].senha);
+            iniciarRede(redeAtual);
         }
     } else if (!estavaConectado) {
         // Voltou. O IP pode ter mudado, entao anuncia de novo.

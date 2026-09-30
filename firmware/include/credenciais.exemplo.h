@@ -25,6 +25,12 @@
 #define WIFI_SSID_2     "hotspot-do-celular"
 #define WIFI_PASSWORD_2 "senha-do-hotspot"
 
+/* IP fixo na segunda rede, OPCIONAL (apague a linha para usar DHCP). Serve
+ * para o hotspot do Windows, onde o computador so alcanca a placa por um
+ * repasse (netsh portproxy) amarrado ao IP dela. Gateway e DNS viram o .1 da
+ * mesma faixa -- no hotspot do Windows, 192.168.137.1. */
+#define WIFI_IP_2       "192.168.137.50"
+
 /* Senha da gravacao pela rede (POST /update, usuario "ota"). Obrigatoria:
  * sem ela, qualquer um na mesma rede poderia gravar firmware na placa.
  * Invente uma; o scripts/gravar_ota.py le daqui mesmo. */
