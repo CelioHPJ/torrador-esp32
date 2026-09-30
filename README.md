@@ -71,7 +71,8 @@ Então a flag `offline` chega na **primeira** mensagem, sem esperar nada.
 ```json
 {
   "temp": 187.4,
-  "timestamp": 154320
+  "timestamp": 154320,
+  "picos": 0
 }
 ```
 
@@ -79,6 +80,10 @@ Então a flag `offline` chega na **primeira** mensagem, sem esperar nada.
 partido, módulo sem comunicação). A placa **não repete o último valor bom**: um
 número congelado com cara de medida é pior que um buraco na curva. O backend
 descarta essas leituras com um aviso no log.
+
+`picos` é quantas amostras o filtro de picos já descartou desde o boot (ver
+[Filtro de picos](#filtro-de-picos)). Vai pela rede porque a placa roda longe
+do USB: se ele crescer sem parar durante uma torra, há ruído no cabo.
 
 `timestamp` é o `millis()` do ESP32 (tempo desde o boot da placa). O backend
 acrescenta três campos antes de repassar ao frontend:
@@ -95,8 +100,11 @@ acrescenta três campos antes de repassar ao frontend:
 
 ```
 firmware/                  projeto PlatformIO (board = ttgo-t-beam)
-  platformio.ini
-  src/main.cpp             leitura do termopar + Wi-Fi + WebSocket
+  platformio.ini           env de USB (ttgo-t-beam) e env de rede (ota)
+  src/main.cpp             leitura do termopar + Wi-Fi + WebSocket + OTA
+  include/filtro_picos.h   descarte de amostras isoladas absurdas
+  include/credenciais.exemplo.h  modelo; o credenciais.h real fica fora do git
+  scripts/gravar_ota.py    envia o firmware para a placa pela rede
   teste_termopar/          sketch isolado de teste do MAX31855
 backend/
   main.py                  ponte T-Beam <-> frontend (FastAPI)
@@ -151,38 +159,87 @@ O firmware já foi compilado com sucesso nesta configuração:
 | ESPAsyncWebServer | 3.12.0 |
 | ArduinoJson | 7.4.3 |
 
-Ocupação resultante: **RAM 3,4%** (43.976 B) e **Flash 63,5%** (832.705 B de
-4 MB) — bastante folga para o código do MAX31855 e do SSR depois.
+Ocupação resultante: **RAM 3,5%** e **Flash 66,9%** (876 KB dos 1,25 MB de
+cada partição de aplicativo — são duas, por causa da gravação pela rede).
 
-Antes de gravar, abra `firmware/src/main.cpp` e troque as duas constantes do
-topo pelos dados da sua rede Wi-Fi:
-
-```cpp
-const char *WIFI_SSID     = "SUA_REDE_AQUI";
-const char *WIFI_PASSWORD = "SUA_SENHA_AQUI";
-```
-
-Com o T-Beam ligado no USB:
+Antes de gravar, crie o arquivo de credenciais a partir do modelo e preencha:
 
 ```bash
 cd firmware
-pio run --target upload        # compila e grava
+cp include/credenciais.exemplo.h include/credenciais.h
+```
+
+| Constante | O que é |
+|---|---|
+| `WIFI_SSID` / `WIFI_PASSWORD` | rede principal, tentada primeiro |
+| `WIFI_SSID_2` / `WIFI_PASSWORD_2` | segunda rede, **opcional** (apague as duas linhas se não usar) |
+| `OTA_SENHA` | senha da gravação pela rede; invente uma |
+
+O `credenciais.h` está no `.gitignore`: as senhas nunca vão para o
+repositório. O ESP32 só fala Wi-Fi de **2,4 GHz**.
+
+Sem rede, a placa **não para de medir**: tenta a principal e a segunda no boot,
+e depois fica alternando entre as duas a cada 15 s até uma responder.
+
+A **primeira** gravação é pelo USB, com o T-Beam ligado no computador:
+
+```bash
+pio run --target upload        # (dentro de firmware/) compila e grava pelo USB
 pio device monitor             # abre o monitor serial (115200)
 ```
 
 No monitor serial vai aparecer o IP da placa:
 
 ```
-[WIFI] conectado!
+[WIFI] conectado em "minha-rede"!
 [WIFI] IP do T-Beam: 192.168.0.42
 [WIFI] WebSocket:    ws://192.168.0.42/ws
        ^^^ anote este IP: é o TBEAM_HOST do backend ^^^
 ```
 
-> **Atenção:** o T-Beam precisa estar **na mesma rede Wi-Fi** do computador que
-> roda o backend. Redes de faculdade com isolamento entre clientes costumam
-> bloquear essa conexão — nesse caso, use um roteador próprio ou o hotspot do
-> celular.
+Sem o USB não há serial para ler o IP. Ele aparece na lista de aparelhos
+conectados do roteador ou do hotspot, com o nome **`torrador`**.
+
+#### Gravar pela rede, sem cabo (OTA)
+
+Depois da primeira gravação pelo USB, as seguintes vão pelo Wi-Fi:
+
+```bash
+cd firmware
+pio run -e ota -t upload --upload-port 192.168.0.42
+```
+
+O `scripts/gravar_ota.py` envia o firmware num `POST /update` para a placa,
+com a `OTA_SENHA` lida do `credenciais.h`. O firmware novo é gravado na
+partição que **não** está em uso: se a transferência cair no meio, a placa
+continua bootando o firmware anterior. Sem a senha, a placa responde 401.
+
+> **Por que HTTP e não o OTA padrão do Arduino (`espota`)?** No `espota` é a
+> placa que abre a conexão de volta para o computador. Com o backend no WSL2
+> em modo NAT (IP `172.20.x`), a placa não alcança esse endereço e a gravação
+> falha. No HTTP quem conecta é só o computador — o mesmo sentido que o
+> backend já usa para ler a temperatura.
+
+> **Grave a rede do lugar para onde vai ANTES de ir.** A gravação pela rede
+> precisa de uma rede que a placa já conheça. Se ela chegar num lugar sem
+> nenhuma das duas redes gravadas, a única saída volta a ser o cabo USB.
+
+#### Redes de faculdade: use o hotspot do notebook
+
+O T-Beam precisa estar **na mesma rede** do computador que roda o backend.
+Redes institucionais costumam impedir isso de três formas: login com usuário
+(que o firmware não faz), isolamento entre aparelhos e firewall.
+
+A saída é o **Hotspot Móvel do Windows**: o notebook entra na rede da
+faculdade (fazendo o login, se houver) e cria a própria rede, onde a placa
+entra como `WIFI_SSID_2`. A placa conversa direto com o notebook e nem
+precisa de internet. O IP dela fica na faixa `192.168.137.x`, listado na
+própria tela do hotspot.
+
+Na configuração do hotspot, escolha a banda de **2,4 GHz**. Muitas placas
+Wi-Fi só criam o hotspot na mesma banda da rede em que estão conectadas: se o
+notebook estiver em 5 GHz, a de 2,4 pode não funcionar — conecte-o à rede
+2,4 GHz da faculdade ou por cabo. O hotspot do celular também serve.
 
 ### 2. Backend (FastAPI)
 
@@ -344,11 +401,36 @@ Dois pontos de referência para conferir se a leitura está correta:
 | Água com gelo derretendo | ~0 °C |
 | Água fervendo | **~97 °C** em Varginha (a ~940 m, a água ferve abaixo de 100 °C) |
 
+**Resultado em 30/09/2026:** no gelo o conjunto marcou **+1,5 °C** (estável em
+1,44..1,50 °C por 1 min), dentro da tolerância somada do chip (±2 °C) e do
+termopar (±2,2 °C). **Nenhuma correção foi aplicada**: com um ponto só não dá
+para saber se o erro é fixo ou cresce com a temperatura. Falta a fervura. Um
+banho com água demais e pouco gelo fica a 1–2 °C e engana o teste — encha o
+copo de gelo.
+
 Se a temperatura **cai** quando você esquenta a ponta, os fios do termopar
 estão invertidos — é o sintoma clássico, não um defeito do módulo. Não confie
 na cor dos fios: no termopar deste projeto, o "amarelo = positivo" do padrão
-americano estava errado, e só o teste da mão mostrou. E alimente o MAX31855 em **3,3 V**, nunca
-em 5 V.
+americano estava errado, e só o teste da mão mostrou. **Refaça o teste da mão
+toda vez que mexer nos bornes** — a polaridade já voltou invertida depois de
+um reaperto. E alimente o MAX31855 em **3,3 V**, nunca em 5 V.
+
+### Filtro de picos
+
+Em 30/09/2026, mexer no cabo gerou duas amostras isoladas de ~265 °C no meio de
+leituras de 1 a 30 °C. O mesmo tamanho (~+256 °C) nas duas aponta para um bit
+trocado na leitura do chip, não para calor — e uma amostra dessas, mesmo diluída
+na média de 4, vira um degrau de dezenas de graus na curva.
+
+`include/filtro_picos.h` descarta a amostra que salta **mais de 25 °C** da
+anterior (as amostras são de 250 ms). Mudança real e rápida não é cortada: se
+**3 amostras seguidas** concordam no valor novo, ele é aceito, com 0,5 s de
+atraso só naquele degrau. O termopar mergulhado em água fervendo sobe ~15 °C
+nos primeiros 250 ms, e uma torra de ar quente não chega perto disso.
+
+A lógica não depende do Arduino, e foi testada no PC com os picos reais e com
+os mergulhos em gelo e fervura. Cada descarte sai na serial como
+`[SENSOR] pico descartado` e soma no campo `picos` do JSON.
 
 O sketch traz a tabela de ligação e, importante, a lista dos GPIOs que o
 T-Beam **já usa** para LoRa, GPS e AXP192 (mesmo sem esses periféricos estarem
@@ -359,7 +441,9 @@ dar boot. Confira o pinout da sua revisão antes de soldar.
 
 ## Próximos passos (fora do escopo desta etapa)
 
-- Validar o termopar em gelo derretendo (~0 °C) e água fervendo (~97 °C).
+- Validar o termopar em água fervendo (~97 °C); o gelo já foi feito.
+- Uma torra real: leitura na faixa de 200 °C e o contador `picos` numa torra
+  inteira.
 - Posicionar o termopar na câmara da pipoqueira, no meio dos grãos.
 - Integração do backend desta pasta com o frontend do repositório principal,
   juntando a curva de temperatura com o índice Agtron estimado pela câmera.
