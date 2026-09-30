@@ -15,7 +15,9 @@
  *  O QUE ELE TRANSMITE (1x por segundo, para todos os clientes conectados):
  *      {
  *        "temp":       23.7,     // float, graus C; null se o sensor falhou
- *        "timestamp":  154320    // millis() do ESP32
+ *        "timestamp":  154320,   // millis() do ESP32
+ *        "picos":      0         // picos descartados desde o boot
+ *                                // (include/filtro_picos.h)
  *      }
  *
  *  SO MEDE, NAO ACIONA NADA. O torrador e uma pipoqueira eletrica de ar
@@ -29,8 +31,10 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
+#include <Update.h>
 #include <SPI.h>
 #include <Adafruit_MAX31855.h>
+#include "filtro_picos.h"
 
 /* ------------------------------------------------------------------------ */
 /*  TERMOPAR (MAX31855 + tipo K)                                             */
@@ -67,6 +71,21 @@ Adafruit_MAX31855 termopar(PINO_MAX_CLK, PINO_MAX_CS, PINO_MAX_DO);
   #error "Falta include/credenciais.h -- copie de include/credenciais.exemplo.h e preencha."
 #endif
 
+#ifndef OTA_SENHA
+  #error "Falta OTA_SENHA em include/credenciais.h -- veja credenciais.exemplo.h."
+#endif
+
+// Redes conhecidas, na ordem de preferencia. A segunda e opcional: existe
+// para a placa ir e voltar entre a casa e o hotspot do celular SEM REGRAVAR.
+struct Rede { const char *ssid; const char *senha; };
+const Rede REDES[] = {
+    { WIFI_SSID,   WIFI_PASSWORD   },
+#ifdef WIFI_SSID_2
+    { WIFI_SSID_2, WIFI_PASSWORD_2 },
+#endif
+};
+const size_t QTD_REDES = sizeof(REDES) / sizeof(REDES[0]);
+size_t redeAtual = 0;   // indice em REDES da ultima tentativa
 
 const uint16_t PORTA_HTTP        = 80;     // servidor HTTP + WebSocket
 
@@ -91,7 +110,17 @@ AsyncWebSocket ws(CAMINHO_WEBSOCKET);
 uint32_t ultimoEnvio   = 0;
 uint32_t ultimaAmostra = 0;
 
-// Quanto o setup() espera pelo Wi-Fi ANTES DE SEGUIR SEM ELE. Existe porque
+// GRAVACAO PELA REDE (OTA por HTTP). E HTTP, e nao o espota do ArduinoOTA,
+// por causa do sentido da conexao: no espota a PLACA conecta de volta no PC,
+// e o PC aqui e o WSL atras de NAT (172.20.x), que a placa nao alcanca. No
+// HTTP quem conecta e so o PC, o mesmo sentido do backend. Quem grava e o
+// scripts/gravar_ota.py, via "pio run -e ota -t upload --upload-port <ip>".
+const char *OTA_USUARIO = "ota";
+bool     reiniciarAposOta = false;   // a gravacao terminou bem: reinicia no loop
+bool     otaGravou        = false;   // Update.end() deu certo nesta requisicao
+uint32_t momentoOta       = 0;
+
+// Quanto o setup() espera por CADA rede ANTES DE SEGUIR SEM ELA. Existe porque
 // ficar presto esperando rede e pior do que rodar sem ela: sem terminar o
 // setup(), a placa nao amostra, nao responde e nao diz o que houve -- ela so
 // parece morta. Um roteador reiniciando na hora errada bastava para isso.
@@ -161,14 +190,31 @@ float lerTemperatura()
 double   somaAmostras = 0.0;
 uint16_t qtdAmostras  = 0;
 
+// Maior salto aceito entre duas amostras seguidas (250 ms). Os picos vistos
+// foram de ~+256 C; o termopar mergulhado em agua fervendo sobe ~15 C nos
+// primeiros 250 ms, e uma torra de ar quente nao chega perto disso. 25 C
+// separa os dois com folga. Ver include/filtro_picos.h.
+const float   LIMITE_SALTO_C     = 25.0f;
+const uint8_t CONFIRMACOES_SALTO = 3;   // amostras seguidas para aceitar nivel novo
+FiltroPicos   filtroPicos(LIMITE_SALTO_C, CONFIRMACOES_SALTO);
+
 // Chamada pelo loop() a cada INTERVALO_AMOSTRAGEM_MS. So acumula, nao envia.
 // Amostra que falhou fica FORA da media: uma so leitura invalida envenenaria
-// o segundo inteiro.
+// o segundo inteiro. Pico isolado tambem, pelo mesmo motivo.
 void amostrarTemperatura()
 {
     float c = lerTemperatura();
     if (isnan(c)) {
         return;
+    }
+    uint32_t niveisAntes = filtroPicos.niveisNovos();
+    if (!filtroPicos.aceitar(c)) {
+        Serial.printf("[SENSOR] pico descartado: %.2f C | picos ate agora: %lu\n",
+                      c, filtroPicos.picos());
+        return;
+    }
+    if (filtroPicos.niveisNovos() != niveisAntes) {
+        Serial.printf("[SENSOR] nivel novo confirmado em %.2f C (nao era pico)\n", c);
     }
     somaAmostras += c;
     qtdAmostras++;
@@ -200,6 +246,10 @@ void transmitirLeitura()
         leitura["temp"] = media;    // media das amostras validas
     }
     leitura["timestamp"] = millis();
+    // Total de picos descartados desde o boot. Vai pela rede porque a placa
+    // roda longe do USB, e sem isso nao ha como saber se o filtro esta
+    // trabalhando -- ou se o cabo esta gerando ruido o tempo todo.
+    leitura["picos"] = filtroPicos.picos();
 
     char buffer[96];
     size_t n = serializeJson(leitura, buffer, sizeof(buffer));
@@ -235,7 +285,7 @@ void aoEventoWebSocket(AsyncWebSocket *servidorWs, AsyncWebSocketClient *cliente
 // precisa ter em TBEAM_HOST. Anunciar so no boot esconderia a troca.
 void anunciarRede()
 {
-    Serial.println("[WIFI] conectado!");
+    Serial.printf ("[WIFI] conectado em \"%s\"!\n", WiFi.SSID().c_str());
     Serial.print  ("[WIFI] IP do T-Beam: ");
     Serial.println(WiFi.localIP());
     Serial.printf ("[WIFI] WebSocket:    ws://%s%s\n",
@@ -244,36 +294,99 @@ void anunciarRede()
     Serial.println("       ^^^ o IP (ou o nome, onde .local resolver) e o TBEAM_HOST ^^^");
 }
 
-// Tenta conectar por no maximo LIMITE_CONEXAO_MS. Devolve se conseguiu.
-// NAO trava esperando: quem chama segue a vida de qualquer jeito.
+// Tenta cada rede de REDES por no maximo LIMITE_CONEXAO_MS. Devolve se
+// conseguiu. NAO trava esperando: quem chama segue a vida de qualquer jeito.
+//
+// Nao usa o WiFiMulti de proposito: o run() dele faz uma varredura BLOQUEANTE
+// de alguns segundos a cada chamada, e no loop isso pararia a amostragem --
+// justamente o que o loop evita. Aqui a troca de rede e um WiFi.begin().
 bool conectarWiFi()
 {
-    Serial.printf("[WIFI] conectando em \"%s\"", WIFI_SSID);
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(NOME_NA_REDE);       // antes do begin(), ou o DHCP nao leva
     WiFi.setSleep(false);                 // evita latencia no WebSocket
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-    uint32_t comeco = millis();
-    while (WiFi.status() != WL_CONNECTED &&
-           millis() - comeco < LIMITE_CONEXAO_MS) {
-        delay(500);
-        Serial.print(".");
+    for (redeAtual = 0; redeAtual < QTD_REDES; redeAtual++) {
+        Serial.printf("[WIFI] conectando em \"%s\"", REDES[redeAtual].ssid);
+        WiFi.begin(REDES[redeAtual].ssid, REDES[redeAtual].senha);
+
+        uint32_t comeco = millis();
+        while (WiFi.status() != WL_CONNECTED &&
+               millis() - comeco < LIMITE_CONEXAO_MS) {
+            delay(500);
+            Serial.print(".");
+        }
+        Serial.println();
+
+        if (WiFi.status() == WL_CONNECTED) {
+            anunciarRede();
+            return true;
+        }
+        Serial.printf("[WIFI] \"%s\" nao respondeu em %lu s.\n",
+                      REDES[redeAtual].ssid, LIMITE_CONEXAO_MS / 1000);
     }
-    Serial.println();
+    redeAtual = 0;
 
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.printf("[WIFI] nao conectou em %lu s. SEGUINDO SEM REDE.\n",
-                      LIMITE_CONEXAO_MS / 1000);
-        Serial.println("       A placa continua amostrando temperatura e vai");
-        Serial.println("       tentar reconectar sozinha. Confira o SSID e a");
-        Serial.println("       senha em include/credenciais.h, e lembre que o");
-        Serial.println("       ESP32 so fala 2,4 GHz.");
-        return false;
+    Serial.println("[WIFI] nenhuma rede conectou. SEGUINDO SEM REDE.");
+    Serial.println("       A placa continua amostrando temperatura e vai");
+    Serial.println("       tentar reconectar sozinha. Confira os SSIDs e as");
+    Serial.println("       senhas em include/credenciais.h, e lembre que o");
+    Serial.println("       ESP32 so fala 2,4 GHz.");
+    return false;
+}
+
+/* ------------------------------------------------------------------------ */
+/*  GRAVACAO PELA REDE (OTA)                                                 */
+/* ------------------------------------------------------------------------ */
+// Corpo do POST /update, chamado pedaco a pedaco enquanto o .bin chega. Grava
+// na particao OTA INATIVA: se a transferencia cair no meio, a placa continua
+// bootando o firmware atual, que nao foi tocado.
+void aoReceberFirmware(AsyncWebServerRequest *req, const String &nome,
+                       size_t indice, uint8_t *dados, size_t tamanho, bool final)
+{
+    // Sem senha, o corpo e descartado; a resposta 401 sai em aoFimDoUpload().
+    if (!req->authenticate(OTA_USUARIO, OTA_SENHA)) {
+        return;
     }
+    if (indice == 0) {
+        otaGravou = false;
+        Serial.printf("[OTA] recebendo %s\n", nome.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+            Update.printError(Serial);
+        }
+    }
+    if (Update.isRunning() && !Update.hasError()) {
+        if (Update.write(dados, tamanho) != tamanho) {
+            Update.printError(Serial);
+        }
+    }
+    if (final && Update.isRunning()) {
+        otaGravou = Update.end(true);
+        if (otaGravou) {
+            Serial.printf("[OTA] %u bytes gravados\n", indice + tamanho);
+        } else {
+            Update.printError(Serial);
+        }
+    }
+}
 
-    anunciarRede();
-    return true;
+void aoFimDoUpload(AsyncWebServerRequest *req)
+{
+    if (!req->authenticate(OTA_USUARIO, OTA_SENHA)) {
+        return req->requestAuthentication(AsyncAuthType::AUTH_BASIC);
+    }
+    AsyncWebServerResponse *resp = otaGravou
+        ? req->beginResponse(200, "text/plain", "OK - gravado, reiniciando\n")
+        : req->beginResponse(500, "text/plain", "FALHOU - firmware atual mantido, veja a serial\n");
+    resp->addHeader("Connection", "close");
+    req->send(resp);
+
+    // Nao reinicia aqui: a resposta ainda nao saiu. O loop reinicia depois.
+    if (otaGravou) {
+        reiniciarAposOta = true;
+        momentoOta = millis();
+    }
+    otaGravou = false;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -313,6 +426,8 @@ void setup()
                   "T-Beam torrador ok. Leituras no WebSocket em /ws");
     });
 
+    servidor.on("/update", HTTP_POST, aoFimDoUpload, aoReceberFirmware);
+
     servidor.begin();
     Serial.println("[HTTP] servidor iniciado");
 }
@@ -322,17 +437,29 @@ void loop()
     ws.cleanupClients();
 
     uint32_t agora = millis();
+
+    // Meio segundo para a resposta do /update chegar ao PC antes do reboot.
+    if (reiniciarAposOta && agora - momentoOta >= 500) {
+        Serial.println("[OTA] reiniciando no firmware novo");
+        delay(100);
+        ESP.restart();
+    }
     bool conectado = (WiFi.status() == WL_CONNECTED);
 
     // A RECONEXAO NAO INTERROMPE MAIS A AMOSTRAGEM. Antes, o loop dava return
     // enquanto a rede estivesse fora, e com isso a placa PARAVA DE MEDIR. Mas
     // a torra nao espera o roteador: o cafe continua esquentando. Medir e
     // local; o que pode faltar e so o envio.
+    //
+    // Com duas redes, cada tentativa vai para a PROXIMA da lista: a placa
+    // saiu de casa e o hotspot ligou, ou o contrario, sem regravar nada.
     if (!conectado) {
         if (agora - ultimaTentativaWiFi >= INTERVALO_RECONEXAO_MS) {
             ultimaTentativaWiFi = agora;
-            Serial.println("[WIFI] sem rede - tentando reconectar...");
-            WiFi.reconnect();
+            redeAtual = (redeAtual + 1) % QTD_REDES;
+            Serial.printf("[WIFI] sem rede - tentando \"%s\"...\n",
+                          REDES[redeAtual].ssid);
+            WiFi.begin(REDES[redeAtual].ssid, REDES[redeAtual].senha);
         }
     } else if (!estavaConectado) {
         // Voltou. O IP pode ter mudado, entao anuncia de novo.
