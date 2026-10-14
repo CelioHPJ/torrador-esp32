@@ -382,6 +382,33 @@ body {
   text-align: center;
 }
 
+/* --- legenda da curva: as duas linhas tem eixos diferentes ------------- */
+.grafico-topo {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--e2) var(--e4);
+}
+.legenda {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--e1) var(--e4);
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--ink-suave);
+}
+.legenda-item::before {
+  content: "";
+  display: inline-block;
+  width: 18px;
+  height: 2px;
+  margin-right: var(--e2);
+  vertical-align: middle;
+}
+.legenda-item--temp::before { background: var(--terracota); }
+.legenda-item--ror::before { background: var(--oliva); }
+
 .dica {
   background: var(--ink);
   color: var(--papel);

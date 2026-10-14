@@ -7,7 +7,7 @@
  *  Os botoes so ANOTAM: marcam eventos (1o crack...) e abrem torra nova.
  *  O tratamento visual esta em estilos.css.
  * ========================================================================== */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer,
   Tooltip, XAxis, YAxis,
@@ -28,6 +28,32 @@ const EVENTOS = [
 ]
 
 const MAX_PONTOS = 1800 // ~30 min a 1 leitura/s
+
+// RoR (rate of rise): quantos graus a temperatura sobe por minuto. Medido
+// contra a leitura de JANELA_ROR_S atras, e nao contra a do segundo
+// anterior: o termopar oscila uns decimos entre leituras, e um segundo de
+// diferenca vezes 60 faria esse ruido pular dezenas de graus por minuto.
+const JANELA_ROR_S = 30
+
+// Anexa "ror" (°C/min) a cada ponto. Os primeiros JANELA_ROR_S segundos
+// ficam sem valor: ainda nao ha leitura antiga o bastante para comparar.
+// Dois ponteiros andando juntos, entao a serie inteira custa O(n).
+function comRoR(pontos) {
+  let j = 0
+  return pontos.map((p) => {
+    while (j + 1 < pontos.length && pontos[j + 1].s <= p.s - JANELA_ROR_S) j++
+    const antigo = pontos[j]
+    if (p.s - antigo.s < JANELA_ROR_S) return { ...p, ror: null }
+    return { ...p, ror: Number((((p.temp - antigo.temp) / (p.s - antigo.s)) * 60).toFixed(1)) }
+  })
+}
+
+// Eixo do RoR em degraus de 20, sempre mostrando o zero: depois da descarga
+// o RoR fica negativo, e e bom ver em que momento ele cruza a linha.
+const dominioRoR = [
+  (min) => Math.min(0, Math.floor(min / 20) * 20),
+  (max) => Math.max(20, Math.ceil(max / 20) * 20),
+]
 
 // Faixa da regua termica sob o numero: do ambiente ao fim da torra.
 const TEMP_PISO = 25
@@ -51,9 +77,11 @@ const relogio = (s) => `${Math.floor(s / 60)}:${String(Math.round(s) % 60).padSt
 
 function Dica({ active, payload, label }) {
   if (!active || !payload?.length) return null
+  const { temp, ror } = payload[0].payload
   return (
     <div className="dica">
-      <div className="dica-temp">{numero(payload[0].value)} °C</div>
+      <div className="dica-temp">{numero(temp)} °C</div>
+      {ror != null && <div className="dica-temp">RoR {numero(ror)} °C/min</div>}
       <div>{relogio(label)} de torra</div>
     </div>
   )
@@ -176,6 +204,9 @@ export default function App() {
     morto: ['backend fora do ar', `sem conexão com ${URL_WS}`],
   }[cadeia]
 
+  const serie = useMemo(() => comRoR(pontos), [pontos])
+  const ror = serie.length ? serie[serie.length - 1].ror : null
+
   const temp = leitura?.temp
   const agtron = leitura?.agtron_estimado
   const preenchimento = temp == null
@@ -250,6 +281,12 @@ export default function App() {
                 {pontos.length ? relogio(pontos[pontos.length - 1].s) : '—'}
               </div>
             </div>
+            <div>
+              <span className="rotulo">RoR °C/min</span>
+              <div className={`campo-valor${ror == null ? ' vazio' : ''}`}>
+                {ror == null ? '—' : numero(ror, 0)}
+              </div>
+            </div>
           </div>
 
           <div className="anotacoes">
@@ -284,7 +321,13 @@ export default function App() {
 
         {/* ========================== curva ============================== */}
         <section className="area-grafico" aria-label="Curva da torra">
-          <h2 className="secao-titulo">Curva da torra</h2>
+          <div className="grafico-topo">
+            <h2 className="secao-titulo">Curva da torra</h2>
+            <p className="legenda">
+              <span className="legenda-item legenda-item--temp">temperatura · °C</span>
+              <span className="legenda-item legenda-item--ror">RoR · °C/min, eixo da direita</span>
+            </p>
+          </div>
           {pontos.length === 0 ? (
             <div className="grafico-vazio">
               aguardando a primeira leitura do T-Beam — a curva se desenha sozinha a partir daqui
@@ -292,7 +335,7 @@ export default function App() {
           ) : (
             <div className="grafico">
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={pontos} margin={{ top: 8, right: 16, bottom: 4, left: 0 }}>
+                <LineChart data={serie} margin={{ top: 8, right: 4, bottom: 4, left: 0 }}>
                   <CartesianGrid stroke="#ede6db" strokeWidth={1} vertical={false} />
                   <XAxis
                     dataKey="s"
@@ -305,6 +348,7 @@ export default function App() {
                     tickMargin={10}
                   />
                   <YAxis
+                    yAxisId="temp"
                     domain={[0, 240]}
                     ticks={[0, 60, 120, 180, 240]}
                     tickFormatter={(v) => `${v}°`}
@@ -313,9 +357,20 @@ export default function App() {
                     tickLine={false}
                     width={44}
                   />
+                  <YAxis
+                    yAxisId="ror"
+                    orientation="right"
+                    domain={dominioRoR}
+                    tickFormatter={(v) => `${v}°/min`}
+                    tick={{ fill: '#4f5b3c', fontSize: 12, fontFamily: 'Inter, sans-serif' }}
+                    axisLine={false}
+                    tickLine={false}
+                    width={60}
+                  />
                   {eventos.map((e, i) => (
                     <ReferenceLine
                       key={i}
+                      yAxisId="temp"
                       x={Math.round(e.tempo_torra)}
                       stroke="#6e6259"
                       strokeDasharray="3 3"
@@ -324,11 +379,22 @@ export default function App() {
                   ))}
                   <Tooltip content={<Dica />} cursor={{ stroke: '#d8cec0', strokeWidth: 1 }} />
                   <Line
+                    yAxisId="temp"
                     type="monotone"
                     dataKey="temp"
                     stroke="#a9502f"
                     strokeWidth={1.75}
                     dot={false}
+                    isAnimationActive={false}
+                  />
+                  <Line
+                    yAxisId="ror"
+                    type="monotone"
+                    dataKey="ror"
+                    stroke="#4f5b3c"
+                    strokeWidth={1.25}
+                    dot={false}
+                    connectNulls={false}
                     isAnimationActive={false}
                   />
                 </LineChart>
