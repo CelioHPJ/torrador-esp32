@@ -15,6 +15,8 @@
    4. Nunca travar nem cair se o T-Beam sumir: marca "offline": true nas
       mensagens enviadas ao frontend e segue tentando reconectar em background.
    5. Zerar a sessao sob demanda (POST /sessao/nova), sem reiniciar o processo.
+   6. Gravar cada torra num CSV em torras/, linha a linha, e marcar eventos
+      (1o crack, descarga...) por POST /evento.
 
  O frontend NUNCA fala direto com o T-Beam - so com este backend.
 
@@ -33,10 +35,12 @@
    TBEAM_HOST     IP do T-Beam na rede        (padrao: 192.168.0.50)
    TBEAM_PORT     porta HTTP/WebSocket        (padrao: 80)
    TBEAM_WS_PATH  caminho do WebSocket        (padrao: /ws)
+   TORRADOR_TORRAS_DIR  pasta dos CSVs das torras (padrao: torras/ na raiz)
 ============================================================================
 """
 
 import asyncio
+import csv
 import json
 import logging
 import math
@@ -44,10 +48,11 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, Optional
 
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # O modulo de visao mora na raiz do repositorio, um nivel acima daqui.
@@ -71,6 +76,23 @@ TBEAM_HOST = os.getenv("TBEAM_HOST", "192.168.0.50")
 TBEAM_PORT = int(os.getenv("TBEAM_PORT", "80"))
 TBEAM_WS_PATH = os.getenv("TBEAM_WS_PATH", "/ws")
 TBEAM_URI = f"ws://{TBEAM_HOST}:{TBEAM_PORT}{TBEAM_WS_PATH}"
+
+# Cada torra vira um CSV proprio. O historico em memoria some se o backend
+# cair ou se alguem zerar a sessao; o arquivo nao. Gravado linha a linha, com
+# flush, para que um travamento no meio da torra perca no maximo um segundo.
+RAIZ_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TORRAS_DIR = os.getenv("TORRADOR_TORRAS_DIR", os.path.join(RAIZ_REPO, "torras"))
+COLUNAS_CSV = ["tempo_torra_s", "temp_c", "hora", "agtron_estimado",
+               "agtron_medido", "evento"]
+
+# Eventos que o painel pode marcar. Lista fechada para os CSVs de torras
+# diferentes continuarem comparaveis.
+EVENTOS_VALIDOS = {
+    "amarelamento": "amarelamento",
+    "crack1": "1º crack",
+    "crack2": "2º crack",
+    "descarga": "descarga",
+}
 
 INTERVALO_RECONEXAO_S = 3.0   # espera entre tentativas de reconexao
 
@@ -222,6 +244,12 @@ class Estado:
         # primeira leitura. Se um dia houver um botao de "iniciar torra" no
         # painel, e este campo que ele passa a definir.
         self.inicio_torra: Optional[float] = None
+        # Eventos marcados nesta sessao: [{"evento", "tempo_torra", "temp"}].
+        self.eventos: list[dict[str, Any]] = []
+        # CSV da torra atual. Aberto na primeira leitura, fechado ao zerar.
+        self.arquivo_csv: Optional[Any] = None
+        self.escritor_csv: Optional[Any] = None
+        self.caminho_csv: Optional[str] = None
         # Menor Agtron ja atingido na sessao (ver processar_leitura).
         self.agtron_estimado: Optional[float] = None
         # Relogio MONOTONICO da ultima leitura valida aceita - ou do instante
@@ -259,6 +287,40 @@ def agtron_medido_agora() -> tuple[Optional[float], Optional[str]]:
     return estado.visao_leitura["agtron"], None
 
 
+def gravar_csv(linha: dict[str, Any]) -> None:
+    """Acrescenta uma linha ao CSV da torra atual, abrindo-o se preciso.
+
+    Falha de disco vira aviso no log, nunca excecao: perder o arquivo e ruim,
+    mas parar de mostrar a temperatura no meio da torra e pior.
+    """
+    try:
+        if estado.escritor_csv is None:
+            os.makedirs(TORRAS_DIR, exist_ok=True)
+            nome = datetime.now().strftime("torra_%Y-%m-%d_%H%M%S.csv")
+            estado.caminho_csv = os.path.join(TORRAS_DIR, nome)
+            estado.arquivo_csv = open(estado.caminho_csv, "w", newline="",
+                                      encoding="utf-8")
+            estado.escritor_csv = csv.DictWriter(estado.arquivo_csv,
+                                                 fieldnames=COLUNAS_CSV)
+            estado.escritor_csv.writeheader()
+            log.info("Gravando a torra em %s", estado.caminho_csv)
+        estado.escritor_csv.writerow({c: linha.get(c, "") for c in COLUNAS_CSV})
+        estado.arquivo_csv.flush()
+    except OSError as erro:
+        log.warning("Nao consegui gravar o CSV da torra: %s", erro)
+
+
+def fechar_csv() -> None:
+    if estado.arquivo_csv is not None:
+        try:
+            estado.arquivo_csv.close()
+        except OSError:
+            pass
+    estado.arquivo_csv = None
+    estado.escritor_csv = None
+    estado.caminho_csv = None
+
+
 def montar_mensagem() -> dict[str, Any]:
     """Mensagem de LEITURA: ultima leitura + flag de conexao.
 
@@ -280,6 +342,7 @@ def montar_mensagem() -> dict[str, Any]:
     base["offline"] = estado.offline
     base["tbeam_uri"] = TBEAM_URI
     base["visao_motivo"] = agtron_medido_agora()[1]
+    base["eventos"] = estado.eventos
     return base
 
 
@@ -457,6 +520,13 @@ async def processar_leitura(bruta: str) -> None:
 
     estado.ultima_leitura = leitura
     estado.historico.append(leitura)
+    gravar_csv({
+        "tempo_torra_s": leitura["tempo_torra"],
+        "temp_c": temp,
+        "hora": datetime.fromtimestamp(leitura["recebido_em"]).strftime("%H:%M:%S"),
+        "agtron_estimado": agtron,
+        "agtron_medido": "" if medido is None else medido,
+    })
 
     await enviar_para_todos(montar_mensagem())
 
@@ -637,6 +707,7 @@ async def ciclo_de_vida(app: FastAPI):
         for tarefa in tarefas:
             tarefa.cancel()
         await asyncio.gather(*tarefas, return_exceptions=True)
+        fechar_csv()
 
 
 app = FastAPI(title="Torrador de Cafe - Backend T-Beam", lifespan=ciclo_de_vida)
@@ -662,6 +733,8 @@ async def status() -> dict[str, Any]:
         "offline": estado.offline,
         "tbeam_uri": TBEAM_URI,
         "leituras_no_historico": len(estado.historico),
+        "csv_da_torra": estado.caminho_csv,
+        "eventos": estado.eventos,
         "frontends_conectados": len(estado.clientes),
         # Diagnostico de bancada: com o socket aberto e este numero crescendo,
         # o problema e a placa ter emudecido, nao a rede ter caido.
@@ -704,14 +777,50 @@ async def sessao_nova() -> dict[str, Any]:
     """
     descartadas = len(estado.historico)
 
+    # Descartadas da MEMORIA. O CSV da torra anterior fica no disco, fechado;
+    # a proxima leitura abre um arquivo novo.
+    arquivo_anterior = estado.caminho_csv
+    fechar_csv()
+
     estado.historico = []
+    estado.eventos = []
     estado.inicio_torra = None
     estado.agtron_estimado = None
 
     await enviar_para_todos({**montar_mensagem(), "historico": []})
 
-    log.info("Sessao zerada (%d leituras descartadas)", descartadas)
-    return {"ok": True, "leituras_descartadas": descartadas}
+    log.info("Sessao zerada (%d leituras descartadas da memoria)", descartadas)
+    return {"ok": True, "leituras_descartadas": descartadas,
+            "csv_anterior": arquivo_anterior}
+
+
+@app.post("/evento/{nome}")
+async def marcar_evento(nome: str) -> dict[str, Any]:
+    """Marca um evento da torra (1o crack, descarga...) no instante atual.
+
+    O tempo e a temperatura sao os da ULTIMA LEITURA, nao os do clique: e a
+    temperatura que estava na tela quando a pessoa ouviu o crack.
+    """
+    if nome not in EVENTOS_VALIDOS:
+        raise HTTPException(404, f"evento desconhecido; use um de {list(EVENTOS_VALIDOS)}")
+    if estado.ultima_leitura is None or estado.inicio_torra is None:
+        raise HTTPException(409, "nenhuma leitura nesta sessao ainda")
+
+    tempo = round(time.time() - estado.inicio_torra, 1)
+    temp = estado.ultima_leitura["temp"]
+    marca = {"evento": nome, "rotulo": EVENTOS_VALIDOS[nome],
+             "tempo_torra": tempo, "temp": temp}
+    estado.eventos.append(marca)
+    gravar_csv({
+        "tempo_torra_s": tempo,
+        "temp_c": temp,
+        "hora": datetime.now().strftime("%H:%M:%S"),
+        "evento": nome,
+    })
+    await enviar_para_todos(montar_mensagem())
+
+    log.info("Evento %s em %.0f s, %.1f C", nome, tempo, temp)
+    return {"ok": True, **marca}
 
 
 @app.websocket("/ws/temperatura")

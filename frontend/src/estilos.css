@@ -308,6 +308,48 @@ body {
 }
 .campo-valor.vazio { color: var(--linha-forte); }
 
+/* ---- anotacoes: so marcam a torra, nao comandam nada ------------------- */
+.anotacoes { margin-top: var(--e5); }
+
+.botoes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--e2);
+  margin: var(--e2) 0 var(--e3);
+}
+
+.botao {
+  font: inherit;
+  font-size: 0.9375rem;
+  color: var(--ink);
+  background: var(--papel);
+  border: 1px solid var(--linha-forte);
+  border-radius: 6px;
+  padding: var(--e2) var(--e3);
+  min-height: 44px;
+  cursor: pointer;
+  text-align: left;
+}
+.botao:hover:not(:disabled) { border-color: var(--terracota); }
+.botao:disabled { color: var(--linha-forte); cursor: default; }
+.botao.marcado {
+  border-color: var(--terracota);
+  background: var(--terracota-tenue);
+}
+.botao-marca {
+  display: block;
+  font-size: 0.8125rem;
+  color: var(--ink-suave);
+  font-variant-numeric: tabular-nums;
+}
+.botao--nova { width: 100%; text-align: center; }
+
+.erro-acao {
+  margin: var(--e2) 0 0;
+  font-size: 0.8125rem;
+  color: var(--oxblood);
+}
+
 /* ==========================================================================
  *  Grafico
  * ========================================================================== */

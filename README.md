@@ -262,6 +262,8 @@ Rotas do backend:
 |---|---|
 | `GET /status` | diagnóstico rápido: online/offline, nº de leituras, última leitura |
 | `GET /historico` | curva completa da sessão atual |
+| `POST /sessao/nova` | fecha a torra atual (o CSV fica em `torras/`) e começa outra |
+| `POST /evento/{nome}` | marca `amarelamento`, `crack1`, `crack2` ou `descarga` no instante atual |
 | `WS /ws/temperatura` | stream que o frontend consome |
 
 ### 3. Frontend (React + Vite)

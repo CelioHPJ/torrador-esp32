@@ -4,11 +4,12 @@
  *  Painel de tela cheia para acompanhar a torra ao vivo: leitura na coluna
  *  da esquerda, curva ocupando todo o resto. So acompanha, nao comanda: a
  *  pipoqueira nao e acionada pela placa, entao nao ha o que comandar daqui.
+ *  Os botoes so ANOTAM: marcam eventos (1o crack...) e abrem torra nova.
  *  O tratamento visual esta em estilos.css.
  * ========================================================================== */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  CartesianGrid, Line, LineChart, ResponsiveContainer,
+  CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer,
   Tooltip, XAxis, YAxis,
 } from 'recharts'
 import './estilos.css'
@@ -16,6 +17,15 @@ import './estilos.css'
 // Endereco do BACKEND (nunca do T-Beam).
 const BACKEND = import.meta.env.VITE_BACKEND_HOST || 'localhost:8000'
 const URL_WS = `ws://${BACKEND}/ws/temperatura`
+const URL_HTTP = `http://${BACKEND}`
+
+// Botoes de anotacao, na ordem em que acontecem numa torra.
+const EVENTOS = [
+  ['amarelamento', 'amarelou'],
+  ['crack1', '1º crack'],
+  ['crack2', '2º crack'],
+  ['descarga', 'descarga'],
+]
 
 const MAX_PONTOS = 1800 // ~30 min a 1 leitura/s
 
@@ -54,6 +64,8 @@ export default function App() {
   const [pontos, setPontos] = useState([])          // serie do grafico
   const [offline, setOffline] = useState(true)      // T-Beam fora do ar?
   const [backendOk, setBackendOk] = useState(false) // WebSocket do backend vivo?
+  const [eventos, setEventos] = useState([])        // marcas da torra atual
+  const [erroAcao, setErroAcao] = useState(null)    // falha de um botao
 
   const tZeroRef = useRef(null) // instante da primeira leitura, vira o "0 s"
 
@@ -94,6 +106,7 @@ export default function App() {
         }
 
         setOffline(Boolean(msg.offline))
+        if (Array.isArray(msg.eventos)) setEventos(msg.eventos)
 
         // Tick de conexao: o backend manda isto enquanto o T-Beam esta fora
         // (e no instante em que ele volta) so para manter o estado da tela em
@@ -138,6 +151,22 @@ export default function App() {
       ws?.close()
     }
   }, [paraPonto])
+
+  // ---- botoes: o backend confirma pelo WebSocket, nada muda aqui direto --
+  const acionar = useCallback(async (caminho) => {
+    setErroAcao(null)
+    try {
+      const r = await fetch(`${URL_HTTP}${caminho}`, { method: 'POST' })
+      if (!r.ok) setErroAcao((await r.json().catch(() => null))?.detail || `erro ${r.status}`)
+    } catch {
+      setErroAcao('backend não respondeu')
+    }
+  }, [])
+
+  const novaTorra = () => {
+    if (pontos.length && !window.confirm('Começar torra nova? A curva atual sai da tela (o CSV dela fica salvo).')) return
+    acionar('/sessao/nova')
+  }
 
   // ---- estado da cadeia --------------------------------------------------
   const cadeia = !backendOk ? 'morto' : offline ? 'offline' : 'ok'
@@ -215,6 +244,41 @@ export default function App() {
                 {pontos.length || '—'}
               </div>
             </div>
+            <div>
+              <span className="rotulo">tempo</span>
+              <div className={`campo-valor${pontos.length === 0 ? ' vazio' : ''}`}>
+                {pontos.length ? relogio(pontos[pontos.length - 1].s) : '—'}
+              </div>
+            </div>
+          </div>
+
+          <div className="anotacoes">
+            <span className="rotulo">anotar</span>
+            <div className="botoes">
+              {EVENTOS.map(([id, texto]) => {
+                const marcado = eventos.find((e) => e.evento === id)
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    className={`botao${marcado ? ' marcado' : ''}`}
+                    disabled={!backendOk || pontos.length === 0}
+                    onClick={() => acionar(`/evento/${id}`)}
+                  >
+                    {texto}
+                    {marcado && (
+                      <span className="botao-marca">
+                        {relogio(marcado.tempo_torra)} · {numero(marcado.temp, 0)}°
+                      </span>
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+            <button type="button" className="botao botao--nova" disabled={!backendOk} onClick={novaTorra}>
+              nova torra
+            </button>
+            {erroAcao && <p className="erro-acao" role="alert">{erroAcao}</p>}
           </div>
         </section>
 
@@ -249,6 +313,15 @@ export default function App() {
                     tickLine={false}
                     width={44}
                   />
+                  {eventos.map((e, i) => (
+                    <ReferenceLine
+                      key={i}
+                      x={Math.round(e.tempo_torra)}
+                      stroke="#6e6259"
+                      strokeDasharray="3 3"
+                      label={{ value: e.rotulo, position: 'insideTopLeft', fill: '#6e6259', fontSize: 12 }}
+                    />
+                  ))}
                   <Tooltip content={<Dica />} cursor={{ stroke: '#d8cec0', strokeWidth: 1 }} />
                   <Line
                     type="monotone"
