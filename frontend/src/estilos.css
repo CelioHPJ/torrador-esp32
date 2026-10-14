@@ -308,6 +308,22 @@ body {
 }
 .campo-valor.vazio { color: var(--linha-forte); }
 
+/* RoR alto: o campo e o aviso em oxblood, a mesma cor de "backend fora do
+   ar" - e a cor de "olhe agora" do painel */
+.campo--alerta .rotulo,
+.campo--alerta .campo-valor { color: var(--oxblood); }
+.campo--alerta .campo-valor { font-weight: 600; }
+
+.alerta-ror {
+  margin: 0;
+  padding: var(--e1) var(--e3);
+  border-left: 3px solid var(--oxblood);
+  background: rgba(138, 46, 34, 0.08);
+  color: var(--oxblood);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+
 /* ---- anotacoes: so marcam a torra, nao comandam nada ------------------- */
 .anotacoes { margin-top: var(--e5); }
 
@@ -440,6 +456,17 @@ body {
   .regua { margin-top: var(--e2); }
   .secao-titulo { margin-bottom: var(--e2); }
   .cabecalho { padding-top: var(--e2); padding-bottom: var(--e2); }
+
+  /* botao marcado com a hora AO LADO do nome, nao embaixo: com a segunda
+     linha, marcar o 1o crack e a descarga empurrava "nova torra" para fora
+     da tela */
+  .botao.marcado {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--e2);
+  }
+  .botao.marcado .botao-marca { display: inline; }
 }
 
 /* ==========================================================================

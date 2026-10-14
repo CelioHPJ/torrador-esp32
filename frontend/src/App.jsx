@@ -48,6 +48,14 @@ function comRoR(pontos) {
   })
 }
 
+// Alerta de RoR alto. Os dois numeros sao CHUTE INICIAL, a calibrar com
+// torras boas: a unica torra real ate hoje (06/10) queimou com o RoR acima
+// de 100 °C/min, e numa torra normal ele fica perto de 10 a 20.
+// A carencia existe porque no primeiro minuto a sonda sai do ambiente e
+// sobe rapido em QUALQUER torra; alertar ali seria alarme falso sempre.
+const LIMITE_ROR = 40       // °C/min
+const CARENCIA_ROR_S = 60   // s de torra antes de o alerta valer
+
 // Eixo do RoR em degraus de 20, sempre mostrando o zero: depois da descarga
 // o RoR fica negativo, e e bom ver em que momento ele cruza a linha.
 const dominioRoR = [
@@ -205,7 +213,25 @@ export default function App() {
   }[cadeia]
 
   const serie = useMemo(() => comRoR(pontos), [pontos])
-  const ror = serie.length ? serie[serie.length - 1].ror : null
+  const ultimo = serie.length ? serie[serie.length - 1] : null
+  const ror = ultimo?.ror ?? null
+
+  // Tempo de desenvolvimento: do 1o crack ate a descarga (ou ate agora, se
+  // ainda nao descarregou), e a fracao que ele e da torra inteira (DTR).
+  const crack1 = eventos.find((e) => e.evento === 'crack1')
+  const descarga = eventos.find((e) => e.evento === 'descarga')
+  const fimTorra = descarga ? descarga.tempo_torra : ultimo?.s
+  const desenvolvimento = crack1 && fimTorra != null
+    ? Math.max(0, fimTorra - crack1.tempo_torra)
+    : null
+  const dtr = desenvolvimento != null && fimTorra > 0
+    ? (desenvolvimento / fimTorra) * 100
+    : null
+
+  // Depois da descarga a torra acabou: o RoR alto do resfriamento (ou de
+  // uma pipoqueira esquecida ligada) nao e mais problema da torra.
+  const rorAlto = ror != null && !descarga
+    && ultimo.s >= CARENCIA_ROR_S && ror > LIMITE_ROR
 
   const temp = leitura?.temp
   const agtron = leitura?.agtron_estimado
@@ -219,6 +245,7 @@ export default function App() {
         <h1 className="titulo">Caderno de torra</h1>
         <p className="subtitulo">
           sessão local · backend <code>{BACKEND}</code>
+          {pontos.length > 0 && ` · ${pontos.length} leituras`}
         </p>
       </header>
 
@@ -270,21 +297,24 @@ export default function App() {
 
           <div className="campos">
             <div>
-              <span className="rotulo">leituras</span>
-              <div className={`campo-valor${pontos.length === 0 ? ' vazio' : ''}`}>
-                {pontos.length || '—'}
-              </div>
-            </div>
-            <div>
               <span className="rotulo">tempo</span>
               <div className={`campo-valor${pontos.length === 0 ? ' vazio' : ''}`}>
                 {pontos.length ? relogio(pontos[pontos.length - 1].s) : '—'}
               </div>
             </div>
-            <div>
+            <div className={rorAlto ? 'campo--alerta' : undefined}>
               <span className="rotulo">RoR °C/min</span>
               <div className={`campo-valor${ror == null ? ' vazio' : ''}`}>
                 {ror == null ? '—' : numero(ror, 0)}
+              </div>
+            </div>
+            <div>
+              <span className="rotulo" title="tempo desde o 1º crack e a fração que ele é da torra">
+                desenvolvimento
+              </span>
+              <div className={`campo-valor${desenvolvimento == null ? ' vazio' : ''}`}>
+                {desenvolvimento == null ? '—' : relogio(desenvolvimento)}
+                {dtr != null && <span className="sufixo"> · {numero(dtr, 0)}%</span>}
               </div>
             </div>
           </div>
@@ -323,6 +353,11 @@ export default function App() {
         <section className="area-grafico" aria-label="Curva da torra">
           <div className="grafico-topo">
             <h2 className="secao-titulo">Curva da torra</h2>
+            {rorAlto && (
+              <p className="alerta-ror" role="alert">
+                RoR acima de {LIMITE_ROR} °C/min: subindo rápido demais
+              </p>
+            )}
             <p className="legenda">
               <span className="legenda-item legenda-item--temp">temperatura · °C</span>
               <span className="legenda-item legenda-item--ror">RoR · °C/min, eixo da direita</span>
@@ -377,6 +412,13 @@ export default function App() {
                       label={{ value: e.rotulo, position: 'insideTopLeft', fill: '#6e6259', fontSize: 12 }}
                     />
                   ))}
+                  <ReferenceLine
+                    yAxisId="ror"
+                    y={LIMITE_ROR}
+                    stroke="#8a2e22"
+                    strokeDasharray="2 4"
+                    label={{ value: `limite ${LIMITE_ROR}°/min`, position: 'insideBottomRight', fill: '#8a2e22', fontSize: 11 }}
+                  />
                   <Tooltip content={<Dica />} cursor={{ stroke: '#d8cec0', strokeWidth: 1 }} />
                   <Line
                     yAxisId="temp"
