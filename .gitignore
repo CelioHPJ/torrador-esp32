@@ -17,3 +17,12 @@ dist/
 # Editores
 .vscode/
 .idea/
+
+# Credenciais de Wi-Fi do firmware (o .exemplo.h e versionado, este nao)
+firmware/include/credenciais.h
+
+# Artefato regenerado a cada 'capturar_amostras.py preview'.
+# Os frames crus em dados/frames/ NAO sao ignorados de proposito: sao dados
+# capturados, insubstituiveis, e permitem reprocessar com outra mira sem
+# refotografar as amostras.
+calibracao/dados/preview.png

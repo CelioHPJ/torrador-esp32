@@ -1,14 +1,15 @@
 /* ==========================================================================
  *  Painel do torrador - "caderno de torra"
  *
- *  Painel de tela cheia para acompanhar a torra ao vivo: leitura e comandos
- *  na coluna da esquerda, curva ocupando todo o resto. A logica de conexao
- *  (WebSocket, reconexao, comandos) e a mesma desde a primeira versao; o
- *  tratamento visual esta em estilos.css.
+ *  Painel de tela cheia para acompanhar a torra ao vivo: leitura na coluna
+ *  da esquerda, curva ocupando todo o resto. So acompanha, nao comanda: a
+ *  pipoqueira nao e acionada pela placa, entao nao ha o que comandar daqui.
+ *  Os botoes so ANOTAM: marcam eventos (1o crack...) e abrem torra nova.
+ *  O tratamento visual esta em estilos.css.
  * ========================================================================== */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  CartesianGrid, Line, LineChart, ResponsiveContainer,
+  CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer,
   Tooltip, XAxis, YAxis,
 } from 'recharts'
 import './estilos.css'
@@ -16,9 +17,51 @@ import './estilos.css'
 // Endereco do BACKEND (nunca do T-Beam).
 const BACKEND = import.meta.env.VITE_BACKEND_HOST || 'localhost:8000'
 const URL_WS = `ws://${BACKEND}/ws/temperatura`
-const URL_COMANDO = `http://${BACKEND}/comando`
+const URL_HTTP = `http://${BACKEND}`
+
+// Botoes de anotacao, na ordem em que acontecem numa torra.
+const EVENTOS = [
+  ['amarelamento', 'amarelou'],
+  ['crack1', '1º crack'],
+  ['crack2', '2º crack'],
+  ['descarga', 'descarga'],
+]
 
 const MAX_PONTOS = 1800 // ~30 min a 1 leitura/s
+
+// RoR (rate of rise): quantos graus a temperatura sobe por minuto. Medido
+// contra a leitura de JANELA_ROR_S atras, e nao contra a do segundo
+// anterior: o termopar oscila uns decimos entre leituras, e um segundo de
+// diferenca vezes 60 faria esse ruido pular dezenas de graus por minuto.
+const JANELA_ROR_S = 30
+
+// Anexa "ror" (°C/min) a cada ponto. Os primeiros JANELA_ROR_S segundos
+// ficam sem valor: ainda nao ha leitura antiga o bastante para comparar.
+// Dois ponteiros andando juntos, entao a serie inteira custa O(n).
+function comRoR(pontos) {
+  let j = 0
+  return pontos.map((p) => {
+    while (j + 1 < pontos.length && pontos[j + 1].s <= p.s - JANELA_ROR_S) j++
+    const antigo = pontos[j]
+    if (p.s - antigo.s < JANELA_ROR_S) return { ...p, ror: null }
+    return { ...p, ror: Number((((p.temp - antigo.temp) / (p.s - antigo.s)) * 60).toFixed(1)) }
+  })
+}
+
+// Alerta de RoR alto. Os dois numeros sao CHUTE INICIAL, a calibrar com
+// torras boas: a unica torra real ate hoje (06/10) queimou com o RoR acima
+// de 100 °C/min, e numa torra normal ele fica perto de 10 a 20.
+// A carencia existe porque no primeiro minuto a sonda sai do ambiente e
+// sobe rapido em QUALQUER torra; alertar ali seria alarme falso sempre.
+const LIMITE_ROR = 40       // °C/min
+const CARENCIA_ROR_S = 60   // s de torra antes de o alerta valer
+
+// Eixo do RoR em degraus de 20, sempre mostrando o zero: depois da descarga
+// o RoR fica negativo, e e bom ver em que momento ele cruza a linha.
+const dominioRoR = [
+  (min) => Math.min(0, Math.floor(min / 20) * 20),
+  (max) => Math.max(20, Math.ceil(max / 20) * 20),
+]
 
 // Faixa da regua termica sob o numero: do ambiente ao fim da torra.
 const TEMP_PISO = 25
@@ -42,9 +85,11 @@ const relogio = (s) => `${Math.floor(s / 60)}:${String(Math.round(s) % 60).padSt
 
 function Dica({ active, payload, label }) {
   if (!active || !payload?.length) return null
+  const { temp, ror } = payload[0].payload
   return (
     <div className="dica">
-      <div className="dica-temp">{numero(payload[0].value)} °C</div>
+      <div className="dica-temp">{numero(temp)} °C</div>
+      {ror != null && <div className="dica-temp">RoR {numero(ror)} °C/min</div>}
       <div>{relogio(label)} de torra</div>
     </div>
   )
@@ -55,14 +100,10 @@ export default function App() {
   const [pontos, setPontos] = useState([])          // serie do grafico
   const [offline, setOffline] = useState(true)      // T-Beam fora do ar?
   const [backendOk, setBackendOk] = useState(false) // WebSocket do backend vivo?
-  const [potencia, setPotencia] = useState(100)
-  const [retorno, setRetorno] = useState(null)      // { texto, falhou }
+  const [eventos, setEventos] = useState([])        // marcas da torra atual
+  const [erroAcao, setErroAcao] = useState(null)    // falha de um botao
 
   const tZeroRef = useRef(null) // instante da primeira leitura, vira o "0 s"
-  // Enquanto o usuario nao encostou no controle, o slider acompanha o valor
-  // que a placa reporta. Depois disso ele para de ser sobrescrito - senao a
-  // leitura que chega a cada segundo apagaria o que voce esta digitando.
-  const usuarioMexeuRef = useRef(false)
 
   // ---- normaliza uma leitura crua do backend em um ponto do grafico ------
   // Usamos "recebido_em" (relogio real do backend) e nao o "timestamp" da
@@ -101,10 +142,17 @@ export default function App() {
         }
 
         setOffline(Boolean(msg.offline))
+        if (Array.isArray(msg.eventos)) setEventos(msg.eventos)
+
+        // Tick de conexao: o backend manda isto enquanto o T-Beam esta fora
+        // (e no instante em que ele volta) so para manter o estado da tela em
+        // dia. Nao ha leitura nova num tick - sair agora e o que impede a
+        // curva de ganhar pontos repetidos e o contador de leituras de subir
+        // sozinho durante uma queda. A ultima temperatura recebida continua
+        // na tela: ela esta em "leitura", que nao e tocado aqui.
+        if (msg.tipo === 'tick') return
+
         if (msg.temp != null) setLeitura(msg)
-        if (msg.potencia_atual != null && !usuarioMexeuRef.current) {
-          setPotencia(msg.potencia_atual)
-        }
 
         // A primeira mensagem traz o historico da sessao: o grafico ja nasce
         // com a curva inteira em vez de comecar vazio.
@@ -140,30 +188,20 @@ export default function App() {
     }
   }, [paraPonto])
 
-  // A partir do primeiro ajuste manual, o slider passa a ser do usuario.
-  const ajustarPotencia = (valor) => {
-    usuarioMexeuRef.current = true
-    setPotencia(Number(valor))
-  }
-
-  // ---- envio de comandos (POST /comando no backend) ----------------------
-  const enviarComando = async (corpo, descricao) => {
-    setRetorno({ texto: 'enviando…', falhou: false })
+  // ---- botoes: o backend confirma pelo WebSocket, nada muda aqui direto --
+  const acionar = useCallback(async (caminho) => {
+    setErroAcao(null)
     try {
-      const resposta = await fetch(URL_COMANDO, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(corpo),
-      })
-      const dados = await resposta.json()
-      setRetorno(
-        resposta.ok
-          ? { texto: `${descricao} — registrado no T-Beam.`, falhou: false }
-          : { texto: dados.detail ?? `falhou (erro ${resposta.status}).`, falhou: true },
-      )
-    } catch (erro) {
-      setRetorno({ texto: `sem resposta do backend: ${erro.message}`, falhou: true })
+      const r = await fetch(`${URL_HTTP}${caminho}`, { method: 'POST' })
+      if (!r.ok) setErroAcao((await r.json().catch(() => null))?.detail || `erro ${r.status}`)
+    } catch {
+      setErroAcao('backend não respondeu')
     }
+  }, [])
+
+  const novaTorra = () => {
+    if (pontos.length && !window.confirm('Começar torra nova? A curva atual sai da tela (o CSV dela fica salvo).')) return
+    acionar('/sessao/nova')
   }
 
   // ---- estado da cadeia --------------------------------------------------
@@ -174,7 +212,27 @@ export default function App() {
     morto: ['backend fora do ar', `sem conexão com ${URL_WS}`],
   }[cadeia]
 
-  const podeComandar = backendOk && !offline
+  const serie = useMemo(() => comRoR(pontos), [pontos])
+  const ultimo = serie.length ? serie[serie.length - 1] : null
+  const ror = ultimo?.ror ?? null
+
+  // Tempo de desenvolvimento: do 1o crack ate a descarga (ou ate agora, se
+  // ainda nao descarregou), e a fracao que ele e da torra inteira (DTR).
+  const crack1 = eventos.find((e) => e.evento === 'crack1')
+  const descarga = eventos.find((e) => e.evento === 'descarga')
+  const fimTorra = descarga ? descarga.tempo_torra : ultimo?.s
+  const desenvolvimento = crack1 && fimTorra != null
+    ? Math.max(0, fimTorra - crack1.tempo_torra)
+    : null
+  const dtr = desenvolvimento != null && fimTorra > 0
+    ? (desenvolvimento / fimTorra) * 100
+    : null
+
+  // Depois da descarga a torra acabou: o RoR alto do resfriamento (ou de
+  // uma pipoqueira esquecida ligada) nao e mais problema da torra.
+  const rorAlto = ror != null && !descarga
+    && ultimo.s >= CARENCIA_ROR_S && ror > LIMITE_ROR
+
   const temp = leitura?.temp
   const agtron = leitura?.agtron_estimado
   const preenchimento = temp == null
@@ -187,12 +245,13 @@ export default function App() {
         <h1 className="titulo">Caderno de torra</h1>
         <p className="subtitulo">
           sessão local · backend <code>{BACKEND}</code>
+          {pontos.length > 0 && ` · ${pontos.length} leituras`}
         </p>
       </header>
 
       <div className="corpo">
-        {/* ================= coluna de leitura + comandos ================= */}
-        <section className="coluna-leitura" aria-label="Leitura e comandos">
+        {/* ======================= coluna de leitura ====================== */}
+        <section className="coluna-leitura" aria-label="Leitura">
           <p className={`status status--${cadeia}`} role="status">
             <span className="ponto" aria-hidden="true" />
             <span>
@@ -238,91 +297,72 @@ export default function App() {
 
           <div className="campos">
             <div>
-              <span className="rotulo">potência</span>
-              <div className={`campo-valor${leitura?.potencia_atual == null ? ' vazio' : ''}`}>
-                {leitura?.potencia_atual ?? '—'}
-                <span className="sufixo"> %</span>
-              </div>
-            </div>
-            <div>
-              <span className="rotulo">motor</span>
-              <div
-                className={`campo-valor${leitura?.motor_ligado ? ' ligado' : ''}${
-                  leitura?.motor_ligado == null ? ' vazio' : ''
-                }`}
-              >
-                {leitura?.motor_ligado == null ? '—' : leitura.motor_ligado ? 'ligado' : 'desligado'}
-              </div>
-            </div>
-            <div>
-              <span className="rotulo">leituras</span>
+              <span className="rotulo">tempo</span>
               <div className={`campo-valor${pontos.length === 0 ? ' vazio' : ''}`}>
-                {pontos.length || '—'}
+                {pontos.length ? relogio(pontos[pontos.length - 1].s) : '—'}
+              </div>
+            </div>
+            <div className={rorAlto ? 'campo--alerta' : undefined}>
+              <span className="rotulo">RoR °C/min</span>
+              <div className={`campo-valor${ror == null ? ' vazio' : ''}`}>
+                {ror == null ? '—' : numero(ror, 0)}
+              </div>
+            </div>
+            <div>
+              <span className="rotulo" title="tempo desde o 1º crack e a fração que ele é da torra">
+                desenvolvimento
+              </span>
+              <div className={`campo-valor${desenvolvimento == null ? ' vazio' : ''}`}>
+                {desenvolvimento == null ? '—' : relogio(desenvolvimento)}
+                {dtr != null && <span className="sufixo"> · {numero(dtr, 0)}%</span>}
               </div>
             </div>
           </div>
 
-          <div className="comandos">
-            <h2 className="secao-titulo">Comandos</h2>
-
-            <div className="linha-comando">
-              <label className="rotulo" htmlFor="potencia">potência</label>
-              <input
-                id="potencia"
-                className="deslizante"
-                type="range" min="0" max="100" value={potencia}
-                disabled={!podeComandar}
-                onChange={(e) => ajustarPotencia(e.target.value)}
-              />
-              <input
-                className="entrada"
-                type="number" min="0" max="100" value={potencia}
-                disabled={!podeComandar}
-                aria-label="potência em porcentagem"
-                onChange={(e) => ajustarPotencia(e.target.value)}
-              />
-              <button
-                className="botao botao--forte"
-                disabled={!podeComandar}
-                onClick={() => enviarComando({ potencia }, `potência ${potencia}%`)}
-              >
-                registrar
-              </button>
+          <div className="anotacoes">
+            <span className="rotulo">anotar</span>
+            <div className="botoes">
+              {EVENTOS.map(([id, texto]) => {
+                const marcado = eventos.find((e) => e.evento === id)
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    className={`botao${marcado ? ' marcado' : ''}`}
+                    disabled={!backendOk || pontos.length === 0}
+                    onClick={() => acionar(`/evento/${id}`)}
+                  >
+                    {texto}
+                    {marcado && (
+                      <span className="botao-marca">
+                        {relogio(marcado.tempo_torra)} · {numero(marcado.temp, 0)}°
+                      </span>
+                    )}
+                  </button>
+                )
+              })}
             </div>
-
-            <div className="linha-comando">
-              <span className="rotulo">motor</span>
-              <button
-                className="botao"
-                disabled={!podeComandar}
-                onClick={() => enviarComando({ motor: 'on' }, 'motor ligado')}
-              >
-                ligar
-              </button>
-              <button
-                className="botao"
-                disabled={!podeComandar}
-                onClick={() => enviarComando({ motor: 'off' }, 'motor desligado')}
-              >
-                desligar
-              </button>
-            </div>
-
-            <p className={`retorno${retorno?.falhou ? ' falhou' : ''}`} aria-live="polite">
-              {retorno?.texto}
-            </p>
-
-            {!podeComandar && (
-              <p className="nota">
-                comandos indisponíveis enquanto a cadeia não estiver completa.
-              </p>
-            )}
+            <button type="button" className="botao botao--nova" disabled={!backendOk} onClick={novaTorra}>
+              nova torra
+            </button>
+            {erroAcao && <p className="erro-acao" role="alert">{erroAcao}</p>}
           </div>
         </section>
 
         {/* ========================== curva ============================== */}
         <section className="area-grafico" aria-label="Curva da torra">
-          <h2 className="secao-titulo">Curva da torra</h2>
+          <div className="grafico-topo">
+            <h2 className="secao-titulo">Curva da torra</h2>
+            {rorAlto && (
+              <p className="alerta-ror" role="alert">
+                RoR acima de {LIMITE_ROR} °C/min: subindo rápido demais
+              </p>
+            )}
+            <p className="legenda">
+              <span className="legenda-item legenda-item--temp">temperatura · °C</span>
+              <span className="legenda-item legenda-item--ror">RoR · °C/min, eixo da direita</span>
+            </p>
+          </div>
           {pontos.length === 0 ? (
             <div className="grafico-vazio">
               aguardando a primeira leitura do T-Beam — a curva se desenha sozinha a partir daqui
@@ -330,7 +370,7 @@ export default function App() {
           ) : (
             <div className="grafico">
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={pontos} margin={{ top: 8, right: 16, bottom: 4, left: 0 }}>
+                <LineChart data={serie} margin={{ top: 8, right: 4, bottom: 4, left: 0 }}>
                   <CartesianGrid stroke="#ede6db" strokeWidth={1} vertical={false} />
                   <XAxis
                     dataKey="s"
@@ -343,6 +383,7 @@ export default function App() {
                     tickMargin={10}
                   />
                   <YAxis
+                    yAxisId="temp"
                     domain={[0, 240]}
                     ticks={[0, 60, 120, 180, 240]}
                     tickFormatter={(v) => `${v}°`}
@@ -351,13 +392,51 @@ export default function App() {
                     tickLine={false}
                     width={44}
                   />
+                  <YAxis
+                    yAxisId="ror"
+                    orientation="right"
+                    domain={dominioRoR}
+                    tickFormatter={(v) => `${v}°/min`}
+                    tick={{ fill: '#4f5b3c', fontSize: 12, fontFamily: 'Inter, sans-serif' }}
+                    axisLine={false}
+                    tickLine={false}
+                    width={60}
+                  />
+                  {eventos.map((e, i) => (
+                    <ReferenceLine
+                      key={i}
+                      yAxisId="temp"
+                      x={Math.round(e.tempo_torra)}
+                      stroke="#6e6259"
+                      strokeDasharray="3 3"
+                      label={{ value: e.rotulo, position: 'insideTopLeft', fill: '#6e6259', fontSize: 12 }}
+                    />
+                  ))}
+                  <ReferenceLine
+                    yAxisId="ror"
+                    y={LIMITE_ROR}
+                    stroke="#8a2e22"
+                    strokeDasharray="2 4"
+                    label={{ value: `limite ${LIMITE_ROR}°/min`, position: 'insideBottomRight', fill: '#8a2e22', fontSize: 11 }}
+                  />
                   <Tooltip content={<Dica />} cursor={{ stroke: '#d8cec0', strokeWidth: 1 }} />
                   <Line
+                    yAxisId="temp"
                     type="monotone"
                     dataKey="temp"
                     stroke="#a9502f"
                     strokeWidth={1.75}
                     dot={false}
+                    isAnimationActive={false}
+                  />
+                  <Line
+                    yAxisId="ror"
+                    type="monotone"
+                    dataKey="ror"
+                    stroke="#4f5b3c"
+                    strokeWidth={1.25}
+                    dot={false}
+                    connectNulls={false}
                     isAnimationActive={false}
                   />
                 </LineChart>

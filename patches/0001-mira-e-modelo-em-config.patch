@@ -1,0 +1,77 @@
+diff --git a/analise_torra.py b/analise_torra.py
+index 785d71af..f791cd07 100644
+--- a/analise_torra.py
++++ b/analise_torra.py
+@@ -1,23 +1,32 @@
++import os
++import sys
++
+ import cv2
+ import numpy as np
+ import pickle  # Biblioteca nativa para carregar arquivos .pkl
+ 
++sys.path.append(os.path.dirname(os.path.abspath(__file__)))
++import config
++
+ # --- MIRA DE PRECISAO (ROI) ---
+-# Edite esses 4 numeros e rode o script de novo para ajustar a mira aos graos,
+-# evitando pegar a parede metalica da pipoqueira.
+-X_INICIAL = 260
+-Y_INICIAL = 70
+-X_FINAL = 420
+-Y_FINAL = 220
++# Vem de config.py, NAO daqui. Esta ferramenta existe para conferir visualmente
++# o que o pipeline de producao mede; se ela tiver a sua propria mira, ela confere
++# outra coisa. Foi o que aconteceu: este arquivo apontava para
++# x 260..420 / y 70..220 enquanto a producao media x 245..355 / y 265..355.
++# Para ajustar a mira, edite config.py -- os dois passam a andar juntos.
++X_INICIAL = config.X_INICIAL
++Y_INICIAL = config.Y_INICIAL
++X_FINAL = config.X_FINAL
++Y_FINAL = config.Y_FINAL
+ 
+ # 1. CARREGANDO O MODELO DE IA (CÉREBRO TREINADO)
+ try:
+-    with open('modelo_agtron_linear.pkl', 'rb') as f:
++    with open(config.MODELO_AGTRON, 'rb') as f:
+         modelo_agtron = pickle.load(f)
+     print("Modelo IA carregado com sucesso!")
+ except Exception as e:
+     print(f"Erro ao carregar o modelo: {e}")
+-    print("Verifique se o arquivo 'modelo_agtron_linear.pkl' está na mesma pasta.")
++    print(f"Verifique se o arquivo '{config.MODELO_AGTRON}' está na mesma pasta.")
+     exit()
+ 
+ # 2. Conectando a fonte de vídeo
+diff --git a/config.py b/config.py
+index 48384487..2b5ea920 100644
+--- a/config.py
++++ b/config.py
+@@ -29,4 +29,11 @@ Y_FINAL = 355
+ # posicionar corretamente sobre o video). Casa com o formato nativo da
+ # camera (ver v4l2-ctl --list-formats-ext).
+ FRAME_WIDTH = 640
+-FRAME_HEIGHT = 480
+\ No newline at end of file
++FRAME_HEIGHT = 480
++
++# --- MODELO EM PRODUCAO ---
++# Fonte unica do nome do .pkl. Antes cada script trazia o seu: validar_sistema.py
++# (a API) usava o v2 de producao enquanto analise_torra.py (a ferramenta de
++# conferir visualmente) carregava o modelo antigo -- ou seja, a ferramenta de
++# verificacao mostrava predicoes de um modelo que nao era o que rodava.
++MODELO_AGTRON = 'modelo_agtron_linear_v2_producao.pkl'
+\ No newline at end of file
+diff --git a/validar_sistema.py b/validar_sistema.py
+index 35f3d91c..c35cfb22 100644
+--- a/validar_sistema.py
++++ b/validar_sistema.py
+@@ -19,7 +19,7 @@ import config
+ # medicoes reais de Agtron. O modelo anterior 'modelo_agtron_linear_interpolado.pkl'
+ # foi mantido no disco como backup para rollback rapido se necessario (ver
+ # gerar_dataset_interpolado.py e treinar_novo.py para o historico completo).
+-CAMINHO_MODELO = os.path.join(DIRETORIO_ATUAL, 'modelo_agtron_linear_v2_producao.pkl')
++CAMINHO_MODELO = os.path.join(DIRETORIO_ATUAL, config.MODELO_AGTRON)
+ 
+ modelo_agtron = None
+ 
