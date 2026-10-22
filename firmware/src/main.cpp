@@ -377,6 +377,13 @@ void aoReceberFirmware(AsyncWebServerRequest *req, const String &nome,
     if (indice == 0) {
         otaGravou = false;
         Serial.printf("[OTA] recebendo %s\n", nome.c_str());
+        // Uma gravacao anterior que caiu no meio deixa o Update aberto, e o
+        // begin() recusa enquanto ele estiver: sem isto, toda OTA seguinte
+        // falharia ate alguem reiniciar a placa na mao.
+        if (Update.isRunning()) {
+            Serial.println("[OTA] descartando gravacao anterior interrompida");
+            Update.abort();
+        }
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
             Update.printError(Serial);
         }

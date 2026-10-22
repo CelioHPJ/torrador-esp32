@@ -125,7 +125,11 @@ def ler_amostras(caminho):
             # L_norm pode faltar em CSV antigo, gravado antes de a coluna
             # existir. Fica como None e o candidato que depende dela e
             # descartado com o motivo dito, em vez de quebrar o treino todo.
-            registro[coluna] = float(bruto) if bruto else None
+            # "nan" conta como ausente tambem: e o que a captura grava em
+            # L_norm quando o cartao de cinza saiu do quadro, e um NaN na
+            # matriz derrubaria o LinearRegression com o treino inteiro junto.
+            valor = float(bruto) if bruto else None
+            registro[coluna] = valor if valor is not None and np.isfinite(valor) else None
         por_amostra[linha["amostra"]].append(registro)
 
     if sem_rotulo:
@@ -241,8 +245,9 @@ def comparar_candidatos(por_amostra, niveis, apenas=None):
         if apenas is not None and rotulo != apenas:
             continue
         if not entradas_disponiveis(por_amostra, entradas):
-            print(f"  {rotulo:<12} descartado: coluna ausente no CSV "
-                  "(capturado antes de a coluna existir?)")
+            print(f"  {rotulo:<12} descartado: coluna ausente ou nan no CSV "
+                  "(capturado antes de a coluna existir, ou cartao de cinza "
+                  "fora do quadro?)")
             continue
         resultados = validar_deixando_uma_fora(por_amostra, entradas)
         resumo = resumir(resultados, niveis)
