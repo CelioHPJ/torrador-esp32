@@ -24,10 +24,11 @@
  *  quente, ligada direto na tomada; a placa nao controla a resistencia nem
  *  a ventoinha, e por isso nao recebe comando nenhum.
  * ========================================================================== */
-
 #include <Arduino.h>
 #include <WiFi.h>
+#include <DNSServer.h>
 #include <ESPmDNS.h>
+#include <Preferences.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
@@ -54,49 +55,54 @@
 Adafruit_MAX31855 termopar(PINO_MAX_CLK, PINO_MAX_CS, PINO_MAX_DO);
 
 /* ------------------------------------------------------------------------ */
-/*  CREDENCIAIS DA REDE                                                      */
+/*  CREDENCIAIS DA REDE (NVS / Portal Cativo + credenciais.h opcional)       */
 /* ------------------------------------------------------------------------ */
-/*  Ficam FORA do git, em include/credenciais.h. Antes de gravar a placa:    */
+/*  A placa aceita credenciais de duas fontes:                               */
+/*    1. Salvas pelo navegador no portal Wi-Fi (http://192.168.4.1/wifi ou   */
+/*       http://<ip>/wifi), gravadas na memoria flash (Preferences / NVS).   */
+/*    2. Opcionalmente, de include/credenciais.h (fora do git), como         */
+/*       fallback caso exista na compilacao.                                 */
 /*                                                                           */
-/*      cp include/credenciais.exemplo.h include/credenciais.h               */
-/*      (e preencha o SSID e a senha no arquivo copiado)                     */
-/*                                                                           */
-/*  O arquivo copiado esta no .gitignore. Este esquema existe para que uma   */
-/*  senha preenchida as pressas para testar nunca acabe publicada junto com  */
-/*  um commit de outra coisa.                                                */
+/*  Quando nao encontra nenhuma rede conhecida, a placa abre o Access Point  */
+/*  "esp32" (senha "torrador", IP 192.168.4.1) com portal cativo, sem        */
+/*  parar de amostrar o termopar.                                            */
 /* ------------------------------------------------------------------------ */
 #if __has_include("credenciais.h")
   #include "credenciais.h"
-#else
-  #error "Falta include/credenciais.h -- copie de include/credenciais.exemplo.h e preencha."
+#endif
+
+#ifndef WIFI_SSID
+  #define WIFI_SSID     "torrador"
+  #define WIFI_PASSWORD "torrador"
 #endif
 
 #ifndef OTA_SENHA
-  #error "Falta OTA_SENHA em include/credenciais.h -- veja credenciais.exemplo.h."
+  #define OTA_SENHA "torrador"
 #endif
-
-// Redes conhecidas, na ordem de preferencia. A segunda e opcional: existe
-// para a placa ir e voltar entre a casa e um hotspot (notebook ou celular)
-// SEM REGRAVAR.
-//
-// ipFixo: nullptr = pega IP por DHCP. Com IP fixo, o gateway e o DNS sao o
-// .1 da mesma faixa /24 -- que e o caso do hotspot do Windows (192.168.137.1).
-// Existe porque no hotspot o computador so alcanca a placa por um repasse
-// (netsh portproxy) amarrado ao IP dela; com DHCP, IP novo quebrava o repasse.
-struct Rede { const char *ssid; const char *senha; const char *ipFixo; };
 
 #if defined(WIFI_SSID_2) && !defined(WIFI_IP_2)
   #define WIFI_IP_2 nullptr
 #endif
 
-const Rede REDES[] = {
-    { WIFI_SSID,   WIFI_PASSWORD,   nullptr   },
-#ifdef WIFI_SSID_2
-    { WIFI_SSID_2, WIFI_PASSWORD_2, WIFI_IP_2 },
-#endif
-};
-const size_t QTD_REDES = sizeof(REDES) / sizeof(REDES[0]);
-size_t redeAtual = 0;   // indice em REDES da ultima tentativa
+struct Rede { const char *ssid; const char *senha; const char *ipFixo; };
+
+Preferences preferencias;
+String nvsSsid;
+String nvsSenha;
+String nvsIpFixo;
+
+Rede   redes[3];
+size_t qtdRedes  = 0;
+size_t redeAtual = 0;   // indice em redes[] da ultima tentativa
+
+const char    *AP_SSID           = "esp32";
+const char    *AP_SENHA          = "torrador";
+const uint16_t PORTA_DNS         = 53;
+DNSServer      dnsServer;
+bool           apAtivo           = false;
+bool           conectarAposSalvar = false;
+uint32_t       momentoSalvarWifi = 0;
+uint32_t       momentoConectouSta = 0;
 
 const uint16_t PORTA_HTTP        = 80;     // servidor HTTP + WebSocket
 
@@ -289,8 +295,78 @@ void aoEventoWebSocket(AsyncWebSocket *servidorWs, AsyncWebSocketClient *cliente
 }
 
 /* ------------------------------------------------------------------------ */
-/*  WI-FI                                                                    */
+/*  WI-FI (NVS + Portal Cativo "esp32")                                     */
 /* ------------------------------------------------------------------------ */
+void carregarRedes()
+{
+    preferencias.begin("wifi", true);
+    nvsSsid   = preferencias.getString("ssid", "");
+    nvsSenha  = preferencias.getString("senha", "");
+    nvsIpFixo = preferencias.getString("ip_fixo", "");
+    preferencias.end();
+
+    qtdRedes = 0;
+    if (nvsSsid.length() > 0) {
+        redes[qtdRedes++] = {
+            nvsSsid.c_str(),
+            nvsSenha.c_str(),
+            nvsIpFixo.length() > 0 ? nvsIpFixo.c_str() : nullptr
+        };
+    }
+#ifdef WIFI_SSID
+    if (nvsSsid != WIFI_SSID) {
+        redes[qtdRedes++] = { WIFI_SSID, WIFI_PASSWORD, nullptr };
+    }
+#endif
+#ifdef WIFI_SSID_2
+    if (nvsSsid != WIFI_SSID_2) {
+        redes[qtdRedes++] = { WIFI_SSID_2, WIFI_PASSWORD_2, WIFI_IP_2 };
+    }
+#endif
+    if (redeAtual >= qtdRedes) {
+        redeAtual = 0;
+    }
+}
+
+void salvarRedeNvs(const String &ssid, const String &senha, const String &ipFixo)
+{
+    preferencias.begin("wifi", false);
+    if (ssid.length() == 0) {
+        preferencias.clear();
+    } else {
+        preferencias.putString("ssid", ssid);
+        preferencias.putString("senha", senha);
+        preferencias.putString("ip_fixo", ipFixo);
+    }
+    preferencias.end();
+}
+
+void ligarPortalAp()
+{
+    if (apAtivo) {
+        return;
+    }
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(AP_SSID, AP_SENHA);
+    dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+    dnsServer.start(PORTA_DNS, "*", WiFi.softAPIP());
+    apAtivo = true;
+    Serial.printf("[WIFI] Portal AP ativo: conecte no Wi-Fi \"%s\" (senha \"%s\") e abra http://%s/wifi\n",
+                  AP_SSID, AP_SENHA, WiFi.softAPIP().toString().c_str());
+}
+
+void desligarPortalAp()
+{
+    if (!apAtivo || WiFi.softAPgetStationNum() > 0) {
+        return;
+    }
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    apAtivo = false;
+    Serial.println("[WIFI] Portal AP desligado (conectado na rede principal).");
+}
+
 // Imprime como chegar na placa. Sai no primeiro sucesso E a cada reconexao,
 // porque o IP pode mudar quando o DHCP renova -- e e esse IP que o backend
 // precisa ter em TBEAM_HOST. Anunciar so no boot esconderia a troca.
@@ -301,39 +377,45 @@ void anunciarRede()
     Serial.println(WiFi.localIP());
     Serial.printf ("[WIFI] WebSocket:    ws://%s%s\n",
                    WiFi.localIP().toString().c_str(), CAMINHO_WEBSOCKET);
+    Serial.printf ("[WIFI] Config Wi-Fi: http://%s/wifi\n",
+                   WiFi.localIP().toString().c_str());
     Serial.printf ("[WIFI] pelo nome:    http://%s.local/\n", NOME_NA_REDE);
     Serial.println("       ^^^ o IP (ou o nome, onde .local resolver) e o TBEAM_HOST ^^^");
 }
 
-// Comeca a conectar na rede REDES[i], com IP fixo ou DHCP conforme ela pedir.
+// Comeca a conectar na rede redes[i], com IP fixo ou DHCP conforme ela pedir.
 // A config vale ate a proxima chamada: sem voltar ao DHCP aqui, o IP fixo de
 // uma rede vazaria para a outra na alternancia do loop.
 void iniciarRede(size_t i)
 {
+    if (i >= qtdRedes) {
+        return;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        WiFi.disconnect(false);
+    }
     IPAddress ip;
-    if (REDES[i].ipFixo != nullptr && ip.fromString(REDES[i].ipFixo)) {
+    if (redes[i].ipFixo != nullptr && ip.fromString(redes[i].ipFixo)) {
         IPAddress gateway(ip[0], ip[1], ip[2], 1);
         WiFi.config(ip, gateway, IPAddress(255, 255, 255, 0), gateway);
     } else {
         WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);   // volta ao DHCP
     }
-    WiFi.begin(REDES[i].ssid, REDES[i].senha);
+    WiFi.begin(redes[i].ssid, redes[i].senha);
 }
 
-// Tenta cada rede de REDES por no maximo LIMITE_CONEXAO_MS. Devolve se
-// conseguiu. NAO trava esperando: quem chama segue a vida de qualquer jeito.
-//
-// Nao usa o WiFiMulti de proposito: o run() dele faz uma varredura BLOQUEANTE
-// de alguns segundos a cada chamada, e no loop isso pararia a amostragem --
-// justamente o que o loop evita. Aqui a troca de rede e um WiFi.begin().
+// Tenta cada rede conhecida por no maximo LIMITE_CONEXAO_MS. Devolve se
+// conseguiu. NAO trava esperando: se falhar, abre o portal "Torrador-Config"
+// e segue a vida amostrando o sensor.
 bool conectarWiFi()
 {
+    carregarRedes();
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(NOME_NA_REDE);       // antes do begin(), ou o DHCP nao leva
     WiFi.setSleep(false);                 // evita latencia no WebSocket
 
-    for (redeAtual = 0; redeAtual < QTD_REDES; redeAtual++) {
-        Serial.printf("[WIFI] conectando em \"%s\"", REDES[redeAtual].ssid);
+    for (redeAtual = 0; redeAtual < qtdRedes; redeAtual++) {
+        Serial.printf("[WIFI] conectando em \"%s\"", redes[redeAtual].ssid);
         iniciarRede(redeAtual);
 
         uint32_t comeco = millis();
@@ -345,20 +427,105 @@ bool conectarWiFi()
         Serial.println();
 
         if (WiFi.status() == WL_CONNECTED) {
+            momentoConectouSta = millis();
             anunciarRede();
             return true;
         }
         Serial.printf("[WIFI] \"%s\" nao respondeu em %lu s.\n",
-                      REDES[redeAtual].ssid, LIMITE_CONEXAO_MS / 1000);
+                      redes[redeAtual].ssid, LIMITE_CONEXAO_MS / 1000);
     }
     redeAtual = 0;
 
-    Serial.println("[WIFI] nenhuma rede conectou. SEGUINDO SEM REDE.");
-    Serial.println("       A placa continua amostrando temperatura e vai");
-    Serial.println("       tentar reconectar sozinha. Confira os SSIDs e as");
-    Serial.println("       senhas em include/credenciais.h, e lembre que o");
-    Serial.println("       ESP32 so fala 2,4 GHz.");
+    Serial.println("[WIFI] nenhuma rede conectou. Abrindo portal de configuracao.");
+    ligarPortalAp();
     return false;
+}
+
+String escaparHtml(const String &s)
+{
+    String out = s;
+    out.replace("&", "&amp;");
+    out.replace("<", "&lt;");
+    out.replace(">", "&gt;");
+    out.replace("\"", "&quot;");
+    return out;
+}
+
+void responderPaginaWifi(AsyncWebServerRequest *req, const String &aviso = "")
+{
+    bool conectado = (WiFi.status() == WL_CONNECTED);
+    String html = "<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'>"
+                  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<title>Torrador - Configurar Wi-Fi</title>"
+                  "<style>"
+                  "body{font-family:system-ui,sans-serif;background:#fcf9f4;color:#2e2621;"
+                  "max-width:460px;margin:0 auto;padding:20px;line-height:1.5}"
+                  "h1{font-size:1.35rem;margin:0 0 8px}"
+                  ".box{border:1px solid #d8cec0;border-radius:8px;padding:14px;margin:14px 0;background:#fff}"
+                  "label{display:block;font-size:.85rem;color:#6e6259;margin-top:10px}"
+                  "input{width:100%;box-sizing:border-box;padding:9px;margin-top:4px;"
+                  "border:1px solid #d8cec0;border-radius:6px;font-size:1rem}"
+                  "button{width:100%;padding:11px;margin-top:14px;border:0;border-radius:6px;"
+                  "background:#a9502f;color:#fff;font-size:1rem;font-weight:600;cursor:pointer}"
+                  "button.sec{background:#f4efe7;color:#2e2621;border:1px solid #d8cec0;font-weight:500}"
+                  "ul{list-style:none;padding:0;margin:8px 0 0}"
+                  "li{padding:8px;border-bottom:1px solid #e7e0d5;cursor:pointer;display:flex;justify-content:space-between}"
+                  "li:hover{background:#f4efe7}"
+                  ".ok{color:#4f5b3c;font-weight:600}.aviso{background:#f4efe7;border-left:3px solid #a9502f;padding:10px;margin:10px 0}"
+                  "code{background:#f4efe7;padding:2px 5px;border-radius:4px}"
+                  "</style></head><body>"
+                  "<h1>Torrador T-Beam &middot; Wi-Fi</h1>";
+
+    if (aviso.length() > 0) {
+        html += "<div class='aviso'>" + aviso + "</div>";
+    }
+
+    html += "<div class='box'>";
+    if (conectado) {
+        html += "<div class='ok'>Conectado em \"" + escaparHtml(WiFi.SSID()) + "\"</div>";
+        html += "<div>IP na rede (<code>TBEAM_HOST</code>): <code>" + WiFi.localIP().toString() + "</code></div>";
+        html += "<div>WebSocket: <code>ws://" + WiFi.localIP().toString() + "/ws</code></div>";
+    } else {
+        html += "<div><b>Sem rede Wi-Fi conectada</b></div>";
+        html += "<div>Modo AP direto (<code>TBEAM_HOST</code>): <code>" + WiFi.softAPIP().toString() + "</code></div>";
+    }
+    if (nvsSsid.length() > 0) {
+        html += "<div style='font-size:.85rem;color:#6e6259;margin-top:6px'>Salvo na memoria: <b>" +
+                escaparHtml(nvsSsid) + "</b></div>";
+    }
+    html += "</div>";
+
+    html += "<div class='box'>"
+            "<button type='button' class='sec' onclick='buscar()'>Buscar redes 2,4 GHz proximas</button>"
+            "<ul id='lista'></ul>"
+            "<form method='POST' action='/wifi'>"
+            "<label>Nome da rede (SSID 2,4 GHz)"
+            "<input id='ssid' name='ssid' required value='" + escaparHtml(nvsSsid) + "' placeholder='Ex.: Hotspot-Celular'></label>"
+            "<label>Senha"
+            "<input id='senha' name='senha' type='password' value='" + escaparHtml(nvsSenha) + "' placeholder='Senha do Wi-Fi'></label>"
+            "<label>IP fixo opcional (deixe vazio para DHCP automatico)"
+            "<input name='ip_fixo' value='" + escaparHtml(nvsIpFixo) + "' placeholder='Ex.: 192.168.137.50'></label>"
+            "<button type='submit'>Salvar e conectar</button>"
+            "</form></div>"
+            "<script>"
+            "let tentativasScan=0;"
+            "async function buscar(){"
+            "const ul=document.getElementById('lista');"
+            "if(tentativasScan===0)ul.innerHTML='<li>Procurando redes 2,4 GHz...</li>';"
+            "try{const r=await fetch('/wifi/scan');if(!r.ok)throw new Error('HTTP '+r.status);"
+            "const d=await r.json();"
+            "if(d.escaneando){if(++tentativasScan>8){tentativasScan=0;ul.innerHTML='<li>Tempo esgotado. Digite o nome da rede abaixo.</li>';return;}setTimeout(buscar,1500);return;}"
+            "tentativasScan=0;ul.innerHTML='';"
+            "if(d.erro){ul.innerHTML='<li>'+d.erro+'</li>';return;}"
+            "d.redes.forEach(n=>{const li=document.createElement('li');"
+            "li.textContent=n.ssid+' ('+n.rssi+' dBm)';"
+            "li.onclick=()=>{document.getElementById('ssid').value=n.ssid;document.getElementById('senha').focus();};"
+            "ul.appendChild(li);});"
+            "if(!d.redes.length)ul.innerHTML='<li>Nenhuma rede 2,4 GHz encontrada</li>';"
+            "}catch(e){tentativasScan=0;ul.innerHTML='<li>Erro ao buscar redes ('+e.message+')</li>';}}"
+            "</script></body></html>";
+
+    req->send(200, "text/html; charset=utf-8", html);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -453,13 +620,87 @@ void setup()
     ws.onEvent(aoEventoWebSocket);
     servidor.addHandler(&ws);
 
-    // Rota de sanidade: abra http://<ip>/ no navegador para ver se esta vivo.
+    // Rota de sanidade: em modo AP sem rede principal, abre direto o portal /wifi.
     servidor.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (apAtivo && WiFi.status() != WL_CONNECTED) {
+            responderPaginaWifi(req);
+            return;
+        }
         req->send(200, "text/plain",
-                  "T-Beam torrador ok. Leituras no WebSocket em /ws");
+                  "T-Beam torrador ok. Leituras no WebSocket em /ws | Configurar Wi-Fi em /wifi");
+    });
+
+    // IMPORTANTE: no ESPAsyncWebServer, "/wifi/scan" precisa vir ANTES de "/wifi",
+    // pois o matcher de rota compara por prefixo se "/wifi" vier primeiro.
+    servidor.on("/wifi/scan", HTTP_GET, [](AsyncWebServerRequest *req) {
+        int16_t n = WiFi.scanComplete();
+        if (n == WIFI_SCAN_FAILED) {
+            // Se o STA estiver preso tentando conectar, libera o radio antes de escanear.
+            if (WiFi.status() != WL_CONNECTED) {
+                WiFi.disconnect(false);
+            }
+            int16_t ret = WiFi.scanNetworks(true);   // assincrono: nao trava o loop de 250 ms
+            if (ret == WIFI_SCAN_FAILED) {
+                req->send(200, "application/json",
+                          "{\"escaneando\":false,\"erro\":\"Falha ao iniciar busca. Digite o SSID manualmente.\",\"redes\":[]}");
+                return;
+            }
+            req->send(200, "application/json", "{\"escaneando\":true,\"redes\":[]}");
+            return;
+        }
+        if (n == WIFI_SCAN_RUNNING) {
+            req->send(200, "application/json", "{\"escaneando\":true,\"redes\":[]}");
+            return;
+        }
+        JsonDocument doc;
+        doc["escaneando"] = false;
+        JsonArray arr = doc["redes"].to<JsonArray>();
+        for (int16_t i = 0; i < n; i++) {
+            JsonObject obj = arr.add<JsonObject>();
+            obj["ssid"]   = WiFi.SSID(i);
+            obj["rssi"]   = WiFi.RSSI(i);
+            obj["aberta"] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        }
+        WiFi.scanDelete();
+        String json;
+        serializeJson(doc, json);
+        req->send(200, "application/json", json);
+    });
+
+    servidor.on("/wifi", HTTP_GET, [](AsyncWebServerRequest *req) {
+        responderPaginaWifi(req);
+    });
+
+    servidor.on("/wifi", HTTP_POST, [](AsyncWebServerRequest *req) {
+        String ssid   = req->hasParam("ssid", true)    ? req->getParam("ssid", true)->value()    : "";
+        String senha  = req->hasParam("senha", true)   ? req->getParam("senha", true)->value()   : "";
+        String ipFixo = req->hasParam("ip_fixo", true) ? req->getParam("ip_fixo", true)->value() : "";
+        ssid.trim();
+        ipFixo.trim();
+
+        salvarRedeNvs(ssid, senha, ipFixo);
+        redeAtual = 0;
+        conectarAposSalvar = true;
+        momentoSalvarWifi  = millis();
+
+        Serial.printf("[WIFI] nova rede salva na NVS: \"%s\" (IP fixo: \"%s\")\n",
+                      ssid.c_str(), ipFixo.c_str());
+        responderPaginaWifi(req,
+            "Rede <b>" + escaparHtml(ssid) + "</b> salva! Conectando agora... "
+            "Confira o IP atribuido na lista do seu hotspot/roteador (aparelho <code>torrador</code>).");
     });
 
     servidor.on("/update", HTTP_POST, aoFimDoUpload, aoReceberFirmware);
+
+    // Portal cativo: quando alguem conecta no AP "esp32", o celular
+    // ou notebook abre uma URL de teste de conectividade; servimos /wifi direto.
+    servidor.onNotFound([](AsyncWebServerRequest *req) {
+        if (apAtivo) {
+            responderPaginaWifi(req);
+        } else {
+            req->send(404, "text/plain", "Nao encontrado. Use /ws ou /wifi");
+        }
+    });
 
     servidor.begin();
     Serial.println("[HTTP] servidor iniciado");
@@ -468,6 +709,9 @@ void setup()
 void loop()
 {
     ws.cleanupClients();
+    if (apAtivo) {
+        dnsServer.processNextRequest();
+    }
 
     uint32_t agora = millis();
 
@@ -477,26 +721,49 @@ void loop()
         delay(100);
         ESP.restart();
     }
+
+    // Dispara a conexao logo apos o usuario salvar no formulario /wifi.
+    // carregarRedes() roda aqui na loopTask para evitar concorrencia com AsyncTCP.
+    if (conectarAposSalvar && agora - momentoSalvarWifi >= 500) {
+        conectarAposSalvar = false;
+        carregarRedes();
+        redeAtual = 0;
+        ultimaTentativaWiFi = agora;
+        if (qtdRedes > 0) {
+            Serial.printf("[WIFI] conectando na rede recem-salva \"%s\"...\n",
+                          redes[0].ssid);
+            iniciarRede(0);
+        }
+    }
+
     bool conectado = (WiFi.status() == WL_CONNECTED);
 
-    // A RECONEXAO NAO INTERROMPE MAIS A AMOSTRAGEM. Antes, o loop dava return
-    // enquanto a rede estivesse fora, e com isso a placa PARAVA DE MEDIR. Mas
-    // a torra nao espera o roteador: o cafe continua esquentando. Medir e
-    // local; o que pode faltar e so o envio.
-    //
-    // Com duas redes, cada tentativa vai para a PROXIMA da lista: a placa
-    // saiu de casa e o hotspot ligou, ou o contrario, sem regravar nada.
+    // A RECONEXAO NAO INTERROMPE MAIS A AMOSTRAGEM.
+    // Enquanto houver alguem conectado no AP "esp32", nao fica
+    // trocando de canal a cada 15 s para nao derrubar quem esta preenchendo a
+    // pagina /wifi (ou lendo o WebSocket direto em 192.168.4.1).
     if (!conectado) {
-        if (agora - ultimaTentativaWiFi >= INTERVALO_RECONEXAO_MS) {
+        if (!apAtivo) {
+            ligarPortalAp();
+        }
+        bool clienteNoAp = (WiFi.softAPgetStationNum() > 0);
+        if (!clienteNoAp && qtdRedes > 0 &&
+            agora - ultimaTentativaWiFi >= INTERVALO_RECONEXAO_MS) {
             ultimaTentativaWiFi = agora;
-            redeAtual = (redeAtual + 1) % QTD_REDES;
+            redeAtual = (redeAtual + 1) % qtdRedes;
             Serial.printf("[WIFI] sem rede - tentando \"%s\"...\n",
-                          REDES[redeAtual].ssid);
+                          redes[redeAtual].ssid);
             iniciarRede(redeAtual);
         }
-    } else if (!estavaConectado) {
-        // Voltou. O IP pode ter mudado, entao anuncia de novo.
-        anunciarRede();
+    } else {
+        if (!estavaConectado) {
+            momentoConectouSta = agora;
+            anunciarRede();
+        }
+        // Desliga o AP 30 s apos conectar na rede principal (se ninguem estiver nele).
+        if (apAtivo && agora - momentoConectouSta >= 30000) {
+            desligarPortalAp();
+        }
     }
     estavaConectado = conectado;
 
@@ -507,24 +774,19 @@ void loop()
     }
 
     // Envio: manda a MEDIA das amostras colhidas desde o envio anterior.
+    // Tambem transmite se houver cliente WebSocket conectado direto pelo AP (192.168.4.1).
     if (agora - ultimoEnvio >= INTERVALO_ENVIO_MS) {
         ultimoEnvio = agora;
 
-        if (conectado) {
+        if (conectado || ws.count() > 0) {
             transmitirLeitura();
         } else {
-            // O TICK DE ENVIO ACONTECE MESMO OFFLINE, DE PROPOSITO.
-            // temperaturaMedia() zera o acumulador; sem chama-la, as amostras
-            // de todo o periodo sem rede se somariam numa unica media. Quando
-            // a rede voltasse, o primeiro valor enviado seria a media de
-            // minutos inteiros -- com cara de leitura instantanea, que e o
-            // tipo de numero errado mais dificil de perceber. De quebra,
-            // qtdAmostras e uint16_t e estouraria depois de ~4,5 h offline.
             float descartada = temperaturaMedia();
             if (agora - ultimoAvisoOffline >= INTERVALO_AVISO_OFFLINE_MS) {
                 ultimoAvisoOffline = agora;
-                Serial.printf("[WIFI] offline: amostrando e descartando "
-                              "(ultima media %.2f C)\n", descartada);
+                Serial.printf("[WIFI] offline (AP \"%s\" em 192.168.4.1): "
+                              "amostrando (ultima media %.2f C)\n",
+                              AP_SSID, descartada);
             }
         }
     }

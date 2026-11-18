@@ -20,10 +20,12 @@ USUARIO = "ota"  # igual a OTA_USUARIO em src/main.cpp
 
 
 def ler_senha() -> str:
+    if not CREDENCIAIS.exists():
+        return "torrador"
     texto = CREDENCIAIS.read_text(encoding="utf-8")
     achado = re.search(r'^\s*#define\s+OTA_SENHA\s+"([^"]*)"', texto, re.MULTILINE)
     if not achado:
-        sys.exit(f"OTA_SENHA nao encontrada em {CREDENCIAIS}")
+        return "torrador"
     return achado.group(1)
 
 
