@@ -85,23 +85,26 @@ const relogio = (s) => `${Math.floor(s / 60)}:${String(Math.round(s) % 60).padSt
 
 function Dica({ active, payload, label }) {
   if (!active || !payload?.length) return null
-  const { temp, ror } = payload[0].payload
+  const { temp, ror, agtron_estimado, agtron_medido } = payload[0].payload
   return (
     <div className="dica">
       <div className="dica-temp">{numero(temp)} °C</div>
       {ror != null && <div className="dica-temp">RoR {numero(ror)} °C/min</div>}
+      {agtron_estimado != null && <div className="dica-temp">Agtron térm. {numero(agtron_estimado)}</div>}
+      {agtron_medido != null && <div className="dica-temp">Agtron câm. {numero(agtron_medido)}</div>}
       <div>{relogio(label)} de torra</div>
     </div>
   )
 }
 
 export default function App() {
-  const [leitura, setLeitura] = useState(null)      // ultima mensagem recebida
-  const [pontos, setPontos] = useState([])          // serie do grafico
-  const [offline, setOffline] = useState(true)      // T-Beam fora do ar?
-  const [backendOk, setBackendOk] = useState(false) // WebSocket do backend vivo?
-  const [eventos, setEventos] = useState([])        // marcas da torra atual
-  const [erroAcao, setErroAcao] = useState(null)    // falha de um botao
+  const [leitura, setLeitura] = useState(null)          // ultima mensagem recebida
+  const [pontos, setPontos] = useState([])              // serie do grafico
+  const [offline, setOffline] = useState(true)          // T-Beam fora do ar?
+  const [backendOk, setBackendOk] = useState(false)     // WebSocket do backend vivo?
+  const [eventos, setEventos] = useState([])            // marcas da torra atual
+  const [visaoMotivo, setVisaoMotivo] = useState(null)  // motivo quando agtron_medido e null
+  const [erroAcao, setErroAcao] = useState(null)        // falha de um botao
 
   const tZeroRef = useRef(null) // instante da primeira leitura, vira o "0 s"
 
@@ -115,6 +118,8 @@ export default function App() {
     return {
       s: Math.round(l.recebido_em - tZeroRef.current), // segundos desde o inicio
       temp: Number(l.temp.toFixed(2)),
+      agtron_estimado: l.agtron_estimado ?? null,
+      agtron_medido: l.agtron_medido ?? null,
     }
   }, [])
 
@@ -142,6 +147,7 @@ export default function App() {
         }
 
         setOffline(Boolean(msg.offline))
+        if ('visao_motivo' in msg) setVisaoMotivo(msg.visao_motivo)
         if (Array.isArray(msg.eventos)) setEventos(msg.eventos)
 
         // Tick de conexao: o backend manda isto enquanto o T-Beam esta fora
@@ -164,6 +170,7 @@ export default function App() {
         // anterior e comecaria em "15:00" em vez de "0:00".
         if (Array.isArray(msg.historico)) {
           tZeroRef.current = null
+          if (msg.historico.length === 0) setLeitura(null)
           setPontos(msg.historico.map(paraPonto).filter(Boolean).slice(-MAX_PONTOS))
           return
         }
@@ -235,6 +242,7 @@ export default function App() {
 
   const temp = leitura?.temp
   const agtron = leitura?.agtron_estimado
+  const agtronMedido = leitura?.agtron_medido
   const preenchimento = temp == null
     ? 0
     : Math.min(100, Math.max(0, ((temp - TEMP_PISO) / (TEMP_TETO - TEMP_PISO)) * 100))
@@ -280,18 +288,44 @@ export default function App() {
           </div>
 
           <div>
-            <span className="rotulo">Agtron estimado</span>
-            <div
-              className={`valor-medio${agtron == null ? ' vazio' : ''}${
-                offline && agtron != null ? ' parado' : ''
-              }`}
-            >
-              {agtron == null ? '—' : numero(agtron)}
-              {agtron != null && <span className="faixa">{faixaAgtron(agtron)}</span>}
-            </div>
+            {agtronMedido != null ? (
+              <div className="agtron-grade">
+                <div>
+                  <span className="rotulo">Agtron estimado · térmico</span>
+                  <div
+                    className={`valor-medio${agtron == null ? ' vazio' : ''}${
+                      offline && agtron != null ? ' parado' : ''
+                    }`}
+                  >
+                    {agtron == null ? '—' : numero(agtron)}
+                    {agtron != null && <span className="faixa">{faixaAgtron(agtron)}</span>}
+                  </div>
+                </div>
+                <div>
+                  <span className="rotulo">Agtron medido · câmera</span>
+                  <div className="valor-medio">
+                    {numero(agtronMedido)}
+                    <span className="faixa">{faixaAgtron(agtronMedido)}</span>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <>
+                <span className="rotulo">Agtron estimado</span>
+                <div
+                  className={`valor-medio${agtron == null ? ' vazio' : ''}${
+                    offline && agtron != null ? ' parado' : ''
+                  }`}
+                >
+                  {agtron == null ? '—' : numero(agtron)}
+                  {agtron != null && <span className="faixa">{faixaAgtron(agtron)}</span>}
+                </div>
+              </>
+            )}
             <p className="aviso-estimativa">
-              estimativa a partir de tempo e temperatura — não é medição de cor.
-              A leitura real virá da câmera numa fase futura.
+              {agtronMedido != null
+                ? 'comparação em tempo real: estimativa térmica (temp + tempo) vs. leitura óptica (CIELAB + IA).'
+                : 'estimativa a partir de tempo e temperatura — não é medição de cor.'}
             </p>
           </div>
 

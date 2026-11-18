@@ -249,17 +249,24 @@ body {
   transition: transform 900ms var(--saida);
 }
 
-/* --- Agtron estimado: segundo valor de destaque, um degrau abaixo do hero -
+/* --- Agtron estimado e medido: segundo nivel de destaque, lado a lado ----
    Em tinta, nao em terracota: o destaque colorido continua reservado a
    temperatura e a linha do grafico. */
+.agtron-grade {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--e3);
+}
+
 .valor-medio {
   display: flex;
   align-items: baseline;
-  gap: 0.4em;
+  flex-wrap: wrap;
+  gap: 0.2em 0.35em;
   margin-top: var(--e2);
   font-family: var(--serif);
   font-weight: 600;
-  font-size: clamp(2.25rem, 2.8vw, 3rem);
+  font-size: clamp(1.9rem, 2.3vw, 2.45rem);
   font-variation-settings: "opsz" 72;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.022em;
@@ -272,7 +279,7 @@ body {
 
 .valor-medio .faixa {
   font-family: var(--sans);
-  font-size: 0.3em;
+  font-size: 0.34em;
   font-weight: 400;
   letter-spacing: 0;
   color: var(--ink-suave);
