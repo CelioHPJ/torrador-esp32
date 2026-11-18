@@ -93,7 +93,8 @@ export PATH="$HOME/.venvs/platformio/bin:$PATH"   # adicione ao ~/.bashrc
 
 > Compilado e validado com PlatformIO 6.2.0, `espressif32 @ 7.1.0`, `AsyncTCP 3.5.0`, `ESPAsyncWebServer 3.12.0`, `ArduinoJson 7.4.3` e `Adafruit MAX31855 ^1.4.2` (ocupação: RAM 3,5%, Flash 66,9%).
 
-Configure as credenciais (Wi-Fi **2,4 GHz** apenas; sem rede no boot, a placa segue medindo e alterna entre a rede 1 e 2 a cada 15 s):
+- **Portal Cativo Wi-Fi (`esp32`) e Memória NVS:** se a placa não encontrar nenhuma rede conhecida no boot (ou perder a conexão), ela abre automaticamente o Access Point **`esp32`** (senha **`torrador`**, IP `192.168.4.1`) sem interromper a leitura do termopar. Basta conectar nele pelo celular/notebook e abrir `http://192.168.4.1/wifi` (ou usar `TBEAM_HOST=192.168.4.1` direto) para escolher uma rede 2,4 GHz e salvar na memória flash (NVS). Mesmo já conectada, a página fica disponível em `http://<ip>/wifi`.
+- **Arquivo `credenciais.h` (opcional, fallback de compilação):** sem ele, o firmware usa `torrador` / `torrador` como rede padrão e senha de OTA. Se quiser embutir outras redes fixas ou senha de OTA personalizada:
 
 ```bash
 cd firmware

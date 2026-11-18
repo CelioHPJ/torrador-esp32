@@ -93,7 +93,8 @@ export PATH="$HOME/.venvs/platformio/bin:$PATH"   # add to ~/.bashrc
 
 > Tested with PlatformIO 6.2.0, `espressif32 @ 7.1.0`, `AsyncTCP 3.5.0`, `ESPAsyncWebServer 3.12.0`, `ArduinoJson 7.4.3`, and `Adafruit MAX31855 ^1.4.2` (usage: RAM 3.5%, Flash 66.9%).
 
-Configure network credentials (**2.4 GHz** Wi-Fi only; without network at boot, the board keeps sampling and alternates between networks 1 and 2 every 15 s):
+- **Captive Wi-Fi Portal (`esp32`) & NVS Memory:** if the board finds no known network at boot (or loses connection), it automatically opens the **`esp32`** Access Point (password **`torrador`**, IP `192.168.4.1`) without stopping thermocouple sampling. Connect to it from your phone or laptop and open `http://192.168.4.1/wifi` (or use `TBEAM_HOST=192.168.4.1` directly) to scan 2.4 GHz networks and save credentials to flash (NVS). When already connected, the page remains accessible at `http://<ip>/wifi`.
+- **`credenciais.h` file (optional compile-time fallback):** without it, the firmware defaults to `torrador` / `torrador` for both Wi-Fi and OTA. If you want to embed static networks or a custom OTA password:
 
 ```bash
 cd firmware
