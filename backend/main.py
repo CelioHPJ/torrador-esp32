@@ -786,6 +786,8 @@ async def sessao_nova() -> dict[str, Any]:
     estado.eventos = []
     estado.inicio_torra = None
     estado.agtron_estimado = None
+    if agtron is not None:
+        agtron.resetar_suavizacao()
 
     await enviar_para_todos({**montar_mensagem(), "historico": []})
 

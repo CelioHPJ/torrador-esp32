@@ -69,6 +69,7 @@ _estado = {
     "cap": None,
     "formato": None,
     "indisponivel": "nao iniciado",
+    "erro_leitura": None,
 }
 _buffer = deque(maxlen=JANELA_SUAVIZACAO)
 _trava = threading.Lock()
@@ -186,6 +187,11 @@ def ler():
         try:
             frame = camera.media_de_frames(_estado["cap"])
             medida = camera.medir(frame)
+        except camera.MiraSaturada as e:
+            # Falha recuperavel de quadro: um reflexo isolado nao pode desligar
+            # a camera pelo resto da torra.
+            _estado["erro_leitura"] = f"camera: {e}"
+            return None
         except camera.CameraSemImagem as e:
             _estado["indisponivel"] = f"camera: {e}"
             return None
@@ -196,7 +202,7 @@ def ler():
             # do quadro, ou mira de referencia na sombra. Predizer com NaN
             # devolveria NaN, que atravessaria a media movel e sairia como
             # "medida" no painel.
-            _estado["indisponivel"] = (
+            _estado["erro_leitura"] = (
                 "medida invalida: " +
                 ", ".join(f"{c}={v}" for c, v in zip(_estado["entradas"], valores)
                           if not np.isfinite(v)) +
@@ -204,6 +210,7 @@ def ler():
             )
             return None
 
+        _estado["erro_leitura"] = None
         entrada = np.array([valores], dtype=float)
         bruto = float(_estado["modelo"].predict(entrada)[0])
 
@@ -223,7 +230,7 @@ def ler():
 
 
 def motivo_indisponivel():
-    return _estado["indisponivel"]
+    return _estado["indisponivel"] or _estado["erro_leitura"]
 
 
 def resetar_suavizacao():

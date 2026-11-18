@@ -54,7 +54,28 @@ import numpy as np
 # Condicao optica. Vale para calibracao E para producao: mexer aqui invalida
 # qualquer modelo treinado antes da mudanca.
 # --------------------------------------------------------------------------
-DISPOSITIVO = "/dev/video0"
+def _detectar_dispositivo_v4l2():
+    """Prefere a camera USB externa (05e3:f12a, index 0) quando o notebook ja
+    ocupa /dev/video0 com a webcam interna."""
+    env = os.environ.get("TORRADOR_VIDEO_DEV", "").strip()
+    if env:
+        return env
+    base = "/sys/class/video4linux"
+    if os.path.isdir(base):
+        for nome in sorted(os.listdir(base)):
+            try:
+                with open(os.path.join(base, nome, "index"), encoding="utf-8") as f:
+                    if f.read().strip() != "0":
+                        continue
+                with open(os.path.join(base, nome, "device", "uevent"), encoding="utf-8") as f:
+                    if "5e3/f12a" in f.read().lower():
+                        return f"/dev/{nome}"
+            except OSError:
+                continue
+    return "/dev/video0"
+
+
+DISPOSITIVO = _detectar_dispositivo_v4l2()
 LARGURA, ALTURA = 640, 480
 
 TEMPERATURA_COR = 4600   # faixa desta camera: 2800..6500 (igual nos dois caminhos)
@@ -467,10 +488,14 @@ def motivo_frame_invalido(frame):
         return "quadro chapado: um valor so, sem variacao nenhuma"
 
     pixels = a.reshape(-1, a.shape[-1]) if a.ndim == 3 else a.reshape(-1, 1)
-    # Pixels clipados ficam de fora da contagem: branco estourado tambem se
-    # repete muito, e sem excluir ele o teste acusaria "buffer vazio" numa
-    # foto real superexposta.
-    vivos = pixels[pixels.max(axis=1) < 255] if pixels.shape[-1] > 1 else pixels
+    # Pixels clipados (255 no claro ou 0,0,0 na sombra escura) ficam de fora:
+    # sem excluir eles, o teste acusaria "buffer vazio" numa foto real muito
+    # clara ou com fundo escuro em volta do torrador. O buffer YUV vazio vira
+    # verde (0, 135, 0), que tem max > 0 e < 255 e continua sendo pego aqui.
+    vivos = (
+        pixels[(pixels.max(axis=1) < 255) & (pixels.max(axis=1) > 0)]
+        if pixels.shape[-1] > 1 else pixels
+    )
     if len(vivos) < 0.05 * len(pixels):
         return None   # quase tudo clipado: e problema de exposicao, nao daqui
 
