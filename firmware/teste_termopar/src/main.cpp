@@ -1,7 +1,7 @@
 /* ==========================================================================
  *  TESTE ISOLADO DO TERMOPAR  -  MAX31855 + termopar tipo K
  *  LilyGO T-Beam (ESP32)
- *  CEFET-MG Varginha - Projeto de extensao (torrador de cafe)
+ *  UFCI-MG Varginha - Projeto de extensao (torrador de cafe)
  * ==========================================================================
  *
  *  PARA QUE SERVE ESTE ARQUIVO

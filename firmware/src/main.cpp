@@ -1,7 +1,7 @@
 /* ==========================================================================
  *  TORRADOR DE CAFE - Firmware do modulo sensor
  *  Placa: LilyGO T-Beam (ESP32)  |  PlatformIO board = ttgo-t-beam
- *  CEFET-MG Varginha - Projeto de extensao
+ *  UFCI-MG Varginha - Projeto de extensao
  * ==========================================================================
  *
  *  PAPEL DESTA PLACA NA ARQUITETURA:

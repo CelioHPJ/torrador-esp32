@@ -1,7 +1,7 @@
 """
 ============================================================================
  TORRADOR DE CAFE - Backend (ponte entre o T-Beam e o frontend)
- CEFET-MG Varginha - Projeto de extensao
+ UFCI-MG Varginha - Projeto de extensao
 ============================================================================
 
     [T-Beam]  --WebSocket-->  [ESTE BACKEND]  --WebSocket-->  [React]

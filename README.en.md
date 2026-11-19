@@ -2,7 +2,7 @@
 
 **[Português](README.md) | [English](README.en.md)**
 
-Extension project — **CEFET-MG Varginha**.
+Extension project — **UFCI-MG Varginha**.
 
 Experimental automation of a fluidized-bed coffee roaster (hot-air popcorn popper, **read-only**, with no heater or fan actuation) organized across three integrated fronts:
 
