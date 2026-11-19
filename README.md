@@ -2,7 +2,7 @@
 
 **[Português](README.md) | [English](README.en.md)**
 
-Projeto de extensão — **CEFET-MG Varginha**.
+Projeto de extensão — **UFCI-MG Varginha**.
 
 Automação experimental de um torrador de café de leito fluidizado (pipoqueira elétrica de ar quente, **somente leitura**, sem controle de resistência ou ventoinha) dividida em três frentes:
 
