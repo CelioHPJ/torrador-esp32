@@ -14,9 +14,11 @@
    3. Guardar o historico da sessao em memoria (lista simples, sem banco).
    4. Nunca travar nem cair se o T-Beam sumir: marca "offline": true nas
       mensagens enviadas ao frontend e segue tentando reconectar em background.
-   5. Zerar a sessao sob demanda (POST /sessao/nova), sem reiniciar o processo.
-   6. Gravar cada torra num CSV em torras/, linha a linha, e marcar eventos
-      (1o crack, descarga...) por POST /evento.
+   5. Controlar inicio e fim da torra sob demanda (POST /torra/iniciar,
+      POST /torra/encerrar e POST /sessao/nova), sem reiniciar o processo.
+   6. Gravar cada torra num CSV em torras/, linha a linha, apenas enquanto a
+      torra estiver em andamento, e marcar eventos (1o crack, descarga...)
+      por POST /evento.
 
  O frontend NUNCA fala direto com o T-Beam - so com este backend.
 
@@ -45,14 +47,16 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Optional
 
 import websockets
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # O modulo de visao mora na raiz do repositorio, um nivel acima daqui.
@@ -238,18 +242,25 @@ class Estado:
         self.conexao_tbeam: Optional[Any] = None
         # Clientes (frontends) conectados no nosso proprio WebSocket.
         self.clientes: set[WebSocket] = set()
-        # Instante da primeira leitura da sessao. E o nosso "CHARGE" (o
-        # momento em que o grao entra no torrador). Por enquanto ele e
-        # implicito: assume-se que a torra comeca quando o backend recebe a
-        # primeira leitura. Se um dia houver um botao de "iniciar torra" no
-        # painel, e este campo que ele passa a definir.
+        # True apenas enquanto uma torra estiver em andamento (iniciada pelo
+        # painel via POST /torra/iniciar). Fora de torra o sistema continua
+        # mostrando temperatura e visao ao vivo, mas nao grava CSV nem
+        # adiciona pontos ao grafico.
+        self.em_torra: bool = False
+        # Instante da primeira leitura da torra atual (CHARGE). Definido na
+        # primeira leitura recebida apos iniciar a torra.
         self.inicio_torra: Optional[float] = None
         # Eventos marcados nesta sessao: [{"evento", "tempo_torra", "temp"}].
         self.eventos: list[dict[str, Any]] = []
-        # CSV da torra atual. Aberto na primeira leitura, fechado ao zerar.
+        # CSV da torra atual. Aberto na primeira leitura, fechado ao encerrar.
         self.arquivo_csv: Optional[Any] = None
         self.escritor_csv: Optional[Any] = None
         self.caminho_csv: Optional[str] = None
+        # Nome opcional dado pelo usuario ao iniciar a torra, notas e nome do
+        # ultimo CSV gerado (mantido apos encerrar para exibicao/download).
+        self.nome_torra: Optional[str] = None
+        self.notas_torra: str = ""
+        self.ultimo_csv_nome: Optional[str] = None
         # Menor Agtron ja atingido na sessao (ver processar_leitura).
         self.agtron_estimado: Optional[float] = None
         # Relogio MONOTONICO da ultima leitura valida aceita - ou do instante
@@ -287,6 +298,61 @@ def agtron_medido_agora() -> tuple[Optional[float], Optional[str]]:
     return estado.visao_leitura["agtron"], None
 
 
+def slugify_nome(texto: Optional[str]) -> str:
+    """Transforma o nome livre da torra em um trecho seguro para nome de arquivo."""
+    if not texto:
+        return ""
+    normalizado = unicodedata.normalize("NFKD", texto)
+    sem_acentos = normalizado.encode("ascii", "ignore").decode("ascii")
+    limpo = re.sub(r"[^a-zA-Z0-9]+", "_", sem_acentos).strip("_").lower()
+    return limpo[:40]
+
+
+def resolver_csv_seguro(arquivo: str) -> str:
+    """Resolve um nome de arquivo CSV dentro de TORRAS_DIR bloqueando path traversal."""
+    nome = os.path.basename(arquivo)
+    if not nome or nome != arquivo or not nome.endswith(".csv"):
+        raise HTTPException(400, "nome de arquivo CSV invalido")
+    caminho = os.path.join(TORRAS_DIR, nome)
+    if not os.path.isfile(caminho):
+        raise HTTPException(404, f"arquivo nao encontrado: {nome}")
+    return caminho
+
+
+def salvar_notas_torra(caminho_csv: Optional[str]) -> Optional[str]:
+    """Grava <csv>_notas.md quando houver nome ou observacoes da torra."""
+    notas = estado.notas_torra.strip()
+    nome = (estado.nome_torra or "").strip()
+    if not caminho_csv or (not notas and not nome):
+        return None
+    base, _ = os.path.splitext(caminho_csv)
+    caminho_notas = f"{base}_notas.md"
+    titulo = nome or os.path.basename(base)
+    linhas = [
+        f"# {titulo}",
+        "",
+        f"- **Data:** {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+        f"- **CSV:** `{os.path.basename(caminho_csv)}`",
+    ]
+    if estado.eventos:
+        linhas.append("- **Eventos:**")
+        for ev in estado.eventos:
+            mins = int(ev["tempo_torra"] // 60)
+            segs = int(round(ev["tempo_torra"] % 60))
+            linhas.append(f"  - {ev['rotulo']}: {mins}:{segs:02d} ({ev['temp']:.1f} °C)")
+    if notas:
+        linhas.extend(["", "## Notas", "", notas])
+    linhas.append("")
+    try:
+        with open(caminho_notas, "w", encoding="utf-8") as f:
+            f.write("\n".join(linhas))
+        log.info("Notas salvas em %s", caminho_notas)
+        return caminho_notas
+    except OSError as erro:
+        log.warning("Nao consegui salvar notas da torra: %s", erro)
+        return None
+
+
 def gravar_csv(linha: dict[str, Any]) -> None:
     """Acrescenta uma linha ao CSV da torra atual, abrindo-o se preciso.
 
@@ -296,8 +362,11 @@ def gravar_csv(linha: dict[str, Any]) -> None:
     try:
         if estado.escritor_csv is None:
             os.makedirs(TORRAS_DIR, exist_ok=True)
-            nome = datetime.now().strftime("torra_%Y-%m-%d_%H%M%S.csv")
+            slug = slugify_nome(estado.nome_torra)
+            sufixo = f"_{slug}" if slug else ""
+            nome = datetime.now().strftime(f"torra_%Y-%m-%d_%H%M%S{sufixo}.csv")
             estado.caminho_csv = os.path.join(TORRAS_DIR, nome)
+            estado.ultimo_csv_nome = nome
             estado.arquivo_csv = open(estado.caminho_csv, "w", newline="",
                                       encoding="utf-8")
             estado.escritor_csv = csv.DictWriter(estado.arquivo_csv,
@@ -340,6 +409,13 @@ def montar_mensagem() -> dict[str, Any]:
         base.update(estado.ultima_leitura)
     base["tipo"] = TIPO_LEITURA
     base["offline"] = estado.offline
+    base["em_torra"] = estado.em_torra
+    base["nome_torra"] = estado.nome_torra
+    base["csv_nome"] = (
+        os.path.basename(estado.caminho_csv)
+        if estado.caminho_csv
+        else estado.ultimo_csv_nome
+    )
     base["tbeam_uri"] = TBEAM_URI
     base["visao_motivo"] = agtron_medido_agora()[1]
     base["eventos"] = estado.eventos
@@ -363,6 +439,13 @@ def montar_tick() -> dict[str, Any]:
     return {
         "tipo": TIPO_TICK,
         "offline": estado.offline,
+        "em_torra": estado.em_torra,
+        "nome_torra": estado.nome_torra,
+        "csv_nome": (
+            os.path.basename(estado.caminho_csv)
+            if estado.caminho_csv
+            else estado.ultimo_csv_nome
+        ),
         "tbeam_uri": TBEAM_URI,
         # Estado da visao viaja no tick tambem: ele nao e dado de leitura, e
         # condicao do sistema. Com a placa fora, e a unica mensagem que chega.
@@ -489,23 +572,6 @@ async def processar_leitura(bruta: str) -> None:
     # entao guardamos tambem o relogio real para o grafico e para logs.
     leitura["recebido_em"] = time.time()
 
-    # ---- estimativa de Agtron -------------------------------------------
-    if estado.inicio_torra is None:
-        estado.inicio_torra = leitura["recebido_em"]
-    tempo_decorrido = leitura["recebido_em"] - estado.inicio_torra
-
-    agtron = estimar_agtron(temp, tempo_decorrido)
-
-    # Trava de sentido unico: torrar e irreversivel - grao nao clareia. Sem
-    # isto, o calor diminuindo faria o Agtron SUBIR na tela, o que nao existe
-    # no mundo real. A trava vive aqui, e nao dentro de estimar_agtron, para
-    # que aquela funcao continue sendo um calculo puro e facil de trocar.
-    if estado.agtron_estimado is not None:
-        agtron = min(agtron, estado.agtron_estimado)
-    estado.agtron_estimado = agtron
-
-    leitura["agtron_estimado"] = agtron
-
     # ---- Agtron MEDIDO, se a visao tiver algo a dizer --------------------
     # Sem trava de sentido unico aqui, ao contrario do estimado. A trava existe
     # porque a heuristica e monotona por construcao e subir seria um artefato
@@ -515,18 +581,40 @@ async def processar_leitura(bruta: str) -> None:
     medido, _motivo = agtron_medido_agora()
     leitura["agtron_medido"] = medido
 
-    leitura["tempo_torra"] = round(tempo_decorrido, 1)
-    # ---------------------------------------------------------------------
+    if estado.em_torra:
+        # ---- estimativa de Agtron ---------------------------------------
+        if estado.inicio_torra is None:
+            estado.inicio_torra = leitura["recebido_em"]
+        tempo_decorrido = leitura["recebido_em"] - estado.inicio_torra
 
-    estado.ultima_leitura = leitura
-    estado.historico.append(leitura)
-    gravar_csv({
-        "tempo_torra_s": leitura["tempo_torra"],
-        "temp_c": temp,
-        "hora": datetime.fromtimestamp(leitura["recebido_em"]).strftime("%H:%M:%S"),
-        "agtron_estimado": agtron,
-        "agtron_medido": "" if medido is None else medido,
-    })
+        agtron_val = estimar_agtron(temp, tempo_decorrido)
+
+        # Trava de sentido unico: torrar e irreversivel - grao nao clareia. Sem
+        # isto, o calor diminuindo faria o Agtron SUBIR na tela, o que nao existe
+        # no mundo real. A trava vive aqui, e nao dentro de estimar_agtron, para
+        # que aquela funcao continue sendo um calculo puro e facil de trocar.
+        if estado.agtron_estimado is not None:
+            agtron_val = min(agtron_val, estado.agtron_estimado)
+        estado.agtron_estimado = agtron_val
+
+        leitura["agtron_estimado"] = agtron_val
+        leitura["tempo_torra"] = round(tempo_decorrido, 1)
+
+        estado.ultima_leitura = leitura
+        estado.historico.append(leitura)
+        gravar_csv({
+            "tempo_torra_s": leitura["tempo_torra"],
+            "temp_c": temp,
+            "hora": datetime.fromtimestamp(leitura["recebido_em"]).strftime("%H:%M:%S"),
+            "agtron_estimado": agtron_val,
+            "agtron_medido": "" if medido is None else medido,
+        })
+    else:
+        # Fora de torra: atualiza a leitura ao vivo na tela (temperatura e
+        # camera), sem gravar CSV nem acrescentar pontos na curva.
+        leitura["agtron_estimado"] = estado.agtron_estimado
+        leitura["tempo_torra"] = None
+        estado.ultima_leitura = leitura
 
     await enviar_para_todos(montar_mensagem())
 
@@ -731,9 +819,16 @@ async def status() -> dict[str, Any]:
     )
     return {
         "offline": estado.offline,
+        "em_torra": estado.em_torra,
+        "nome_torra": estado.nome_torra,
         "tbeam_uri": TBEAM_URI,
         "leituras_no_historico": len(estado.historico),
         "csv_da_torra": estado.caminho_csv,
+        "csv_nome": (
+            os.path.basename(estado.caminho_csv)
+            if estado.caminho_csv
+            else estado.ultimo_csv_nome
+        ),
         "eventos": estado.eventos,
         "frontends_conectados": len(estado.clientes),
         # Diagnostico de bancada: com o socket aberto e este numero crescendo,
@@ -756,44 +851,180 @@ async def historico() -> dict[str, Any]:
     return {"total": len(estado.historico), "leituras": estado.historico}
 
 
+@app.post("/torra/iniciar")
+async def iniciar_torra(
+    dados: Optional[dict[str, Any]] = Body(default=None),
+) -> dict[str, Any]:
+    """Inicia uma nova torra, liberando o historico e a gravacao em CSV.
+
+    Aceita JSON opcional {"nome": "...", "notas": "..."} para identificar o
+    lote no nome do CSV e no arquivo de notas.
+    """
+    if estado.em_torra:
+        raise HTTPException(409, "uma torra ja esta em andamento")
+
+    nome = ""
+    notas = ""
+    if isinstance(dados, dict):
+        nome = str(dados.get("nome") or "").strip()[:80]
+        notas = str(dados.get("notas") or "").strip()[:2000]
+
+    fechar_csv()
+    estado.historico = []
+    estado.eventos = []
+    estado.inicio_torra = None
+    estado.agtron_estimado = None
+    estado.nome_torra = nome or None
+    estado.notas_torra = notas
+    estado.ultimo_csv_nome = None
+    estado.em_torra = True
+    if agtron is not None:
+        agtron.resetar_suavizacao()
+
+    await enviar_para_todos({**montar_mensagem(), "historico": []})
+
+    log.info("Torra iniciada pelo painel%s", f" ({nome})" if nome else "")
+    return {"ok": True, "em_torra": True, "nome_torra": estado.nome_torra}
+
+
+@app.post("/torra/encerrar")
+async def encerrar_torra(
+    dados: Optional[dict[str, Any]] = Body(default=None),
+) -> dict[str, Any]:
+    """Encerra a torra em andamento, fecha o CSV e salva notas se houver.
+
+    Mantem a curva e os eventos na memoria para que continuem visiveis na
+    tela apos o termino, sem gravar as leituras de resfriamento no arquivo.
+    """
+    if not estado.em_torra:
+        raise HTTPException(409, "nenhuma torra em andamento")
+
+    if isinstance(dados, dict) and "notas" in dados:
+        extras = str(dados.get("notas") or "").strip()[:2000]
+        if extras:
+            estado.notas_torra = (
+                f"{estado.notas_torra}\n\n{extras}".strip()
+                if estado.notas_torra
+                else extras
+            )
+
+    arquivo_encerrado = estado.caminho_csv
+    csv_nome = os.path.basename(arquivo_encerrado) if arquivo_encerrado else None
+    estado.em_torra = False
+    fechar_csv()
+    notas_salvas = salvar_notas_torra(arquivo_encerrado)
+    if csv_nome:
+        estado.ultimo_csv_nome = csv_nome
+
+    await enviar_para_todos(montar_mensagem())
+
+    log.info("Torra encerrada pelo painel (CSV: %s)", arquivo_encerrado)
+    return {
+        "ok": True,
+        "em_torra": False,
+        "csv_encerrado": arquivo_encerrado,
+        "csv_nome": csv_nome,
+        "notas_salvas": notas_salvas,
+    }
+
+
 @app.post("/sessao/nova")
 async def sessao_nova() -> dict[str, Any]:
-    """Zera a sessao de torra sem reiniciar o backend.
-
-    Serve para encadear demonstracoes: entre uma torra e outra, isto devolve o
-    sistema ao estado "nada torrado ainda" - historico vazio, cronometro da
-    torra zerado e Agtron solto da trava de sentido unico - sem derrubar o
-    processo, sem derrubar os frontends conectados e sem mexer na conexao com
-    o T-Beam, que segue exatamente como estava.
-
-    Zerar inicio_torra importa mais do que parece: ele e o CHARGE implicito da
-    sessao. Com o backend ligado desde a montagem do equipamento, o "tempo de
-    torra" ja chegaria saturado no cafe seguinte e a estimativa de Agtron
-    escureceria rapido demais.
-
-    O broadcast final leva "historico": [], que e exatamente o formato que o
-    frontend ja usa para redesenhar a curva do zero - nenhuma mudanca do lado
-    dele foi necessaria para isto funcionar.
-    """
+    """Zera a sessao de torra e volta ao estado de espera, sem reiniciar o backend."""
     descartadas = len(estado.historico)
 
-    # Descartadas da MEMORIA. O CSV da torra anterior fica no disco, fechado;
-    # a proxima leitura abre um arquivo novo.
+    # Descartadas da MEMORIA. O CSV da torra anterior fica no disco, fechado.
     arquivo_anterior = estado.caminho_csv
+    estado.em_torra = False
     fechar_csv()
 
     estado.historico = []
     estado.eventos = []
     estado.inicio_torra = None
     estado.agtron_estimado = None
+    estado.nome_torra = None
+    estado.notas_torra = ""
+    estado.ultimo_csv_nome = None
     if agtron is not None:
         agtron.resetar_suavizacao()
 
     await enviar_para_todos({**montar_mensagem(), "historico": []})
 
     log.info("Sessao zerada (%d leituras descartadas da memoria)", descartadas)
-    return {"ok": True, "leituras_descartadas": descartadas,
+    return {"ok": True, "em_torra": False, "leituras_descartadas": descartadas,
             "csv_anterior": arquivo_anterior}
+
+
+@app.get("/torras")
+async def listar_torras() -> dict[str, Any]:
+    """Lista os arquivos CSV salvos em TORRAS_DIR (mais recentes primeiro)."""
+    if not os.path.isdir(TORRAS_DIR):
+        return {"torras": []}
+    itens: list[dict[str, Any]] = []
+    for nome in os.listdir(TORRAS_DIR):
+        if not nome.endswith(".csv"):
+            continue
+        caminho = os.path.join(TORRAS_DIR, nome)
+        if not os.path.isfile(caminho):
+            continue
+        try:
+            st = os.stat(caminho)
+        except OSError:
+            continue
+        itens.append({
+            "arquivo": nome,
+            "tamanho_bytes": st.st_size,
+            "modificado_em": st.st_mtime,
+        })
+    itens.sort(key=lambda x: (x["modificado_em"], x["arquivo"]), reverse=True)
+    return {"torras": itens}
+
+
+@app.get("/torras/{arquivo}")
+async def ler_torra_referencia(arquivo: str) -> dict[str, Any]:
+    """Retorna os pontos (tempo, temperatura) de um CSV salvo para sobrepor no grafico."""
+    caminho = resolver_csv_seguro(arquivo)
+    pontos: list[dict[str, Any]] = []
+    eventos: list[dict[str, Any]] = []
+    try:
+        with open(caminho, "r", encoding="utf-8", newline="") as f:
+            leitor = csv.DictReader(f)
+            for row in leitor:
+                try:
+                    s = round(float(row["tempo_torra_s"]))
+                    temp = round(float(row["temp_c"]), 2)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                ev = (row.get("evento") or "").strip()
+                if ev:
+                    eventos.append({
+                        "evento": ev,
+                        "rotulo": EVENTOS_VALIDOS.get(ev, ev),
+                        "tempo_torra": s,
+                        "temp": temp,
+                    })
+                else:
+                    pontos.append({"s": s, "temp": temp})
+    except OSError as erro:
+        raise HTTPException(500, f"erro ao ler CSV: {erro}") from erro
+    return {"arquivo": os.path.basename(caminho), "pontos": pontos, "eventos": eventos}
+
+
+@app.get("/torras/{arquivo}/download")
+async def baixar_torra_csv(arquivo: str) -> Response:
+    """Baixa um arquivo CSV salvo em TORRAS_DIR."""
+    caminho = resolver_csv_seguro(arquivo)
+    nome = os.path.basename(caminho)
+    try:
+        with open(caminho, "rb") as f:
+            conteudo = f.read()
+    except OSError as erro:
+        raise HTTPException(500, f"erro ao ler CSV: {erro}") from erro
+    return Response(
+        content=conteudo,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{nome}"'},
+    )
 
 
 @app.post("/evento/{nome}")
@@ -805,6 +1036,8 @@ async def marcar_evento(nome: str) -> dict[str, Any]:
     """
     if nome not in EVENTOS_VALIDOS:
         raise HTTPException(404, f"evento desconhecido; use um de {list(EVENTOS_VALIDOS)}")
+    if not estado.em_torra:
+        raise HTTPException(409, "inicie a torra antes de anotar eventos")
     if estado.ultima_leitura is None or estado.inicio_torra is None:
         raise HTTPException(409, "nenhuma leitura nesta sessao ainda")
 

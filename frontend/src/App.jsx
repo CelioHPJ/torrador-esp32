@@ -33,7 +33,8 @@ const MAX_PONTOS = 1800 // ~30 min a 1 leitura/s
 // contra a leitura de JANELA_ROR_S atras, e nao contra a do segundo
 // anterior: o termopar oscila uns decimos entre leituras, e um segundo de
 // diferenca vezes 60 faria esse ruido pular dezenas de graus por minuto.
-const JANELA_ROR_S = 30
+// 15 s equilibra suavizacao e resposta rapida em torras curtas (~3 min).
+const JANELA_ROR_S = 15
 
 // Anexa "ror" (°C/min) a cada ponto. Os primeiros JANELA_ROR_S segundos
 // ficam sem valor: ainda nao ha leitura antiga o bastante para comparar.
@@ -54,7 +55,7 @@ function comRoR(pontos) {
 // A carencia existe porque no primeiro minuto a sonda sai do ambiente e
 // sobe rapido em QUALQUER torra; alertar ali seria alarme falso sempre.
 const LIMITE_ROR = 40       // °C/min
-const CARENCIA_ROR_S = 60   // s de torra antes de o alerta valer
+const CARENCIA_ROR_S = 30   // s de torra antes de o alerta valer
 
 // Eixo do RoR em degraus de 20, sempre mostrando o zero: depois da descarga
 // o RoR fica negativo, e e bom ver em que momento ele cruza a linha.
@@ -85,13 +86,16 @@ const relogio = (s) => `${Math.floor(s / 60)}:${String(Math.round(s) % 60).padSt
 
 function Dica({ active, payload, label }) {
   if (!active || !payload?.length) return null
-  const { temp, ror, agtron_estimado, agtron_medido } = payload[0].payload
+  const principal = payload.find((p) => p.name !== 'ref')
+  const ref = payload.find((p) => p.name === 'ref')
+  const dados = principal?.payload
   return (
     <div className="dica">
-      <div className="dica-temp">{numero(temp)} °C</div>
-      {ror != null && <div className="dica-temp">RoR {numero(ror)} °C/min</div>}
-      {agtron_estimado != null && <div className="dica-temp">Agtron térm. {numero(agtron_estimado)}</div>}
-      {agtron_medido != null && <div className="dica-temp">Agtron câm. {numero(agtron_medido)}</div>}
+      {dados?.temp != null && <div className="dica-temp">{numero(dados.temp)} °C</div>}
+      {dados?.ror != null && <div className="dica-temp">RoR {numero(dados.ror)} °C/min</div>}
+      {dados?.agtron_estimado != null && <div className="dica-temp">Agtron térm. {numero(dados.agtron_estimado)}</div>}
+      {dados?.agtron_medido != null && <div className="dica-temp">Agtron câm. {numero(dados.agtron_medido)}</div>}
+      {ref?.value != null && <div className="dica-temp">Ref. {numero(ref.value)} °C</div>}
       <div>{relogio(label)} de torra</div>
     </div>
   )
@@ -101,10 +105,23 @@ export default function App() {
   const [leitura, setLeitura] = useState(null)          // ultima mensagem recebida
   const [pontos, setPontos] = useState([])              // serie do grafico
   const [offline, setOffline] = useState(true)          // T-Beam fora do ar?
+  const [emTorra, setEmTorra] = useState(false)         // gravando torra e CSV?
+  const [nomeTorra, setNomeTorra] = useState(null)      // nome da torra atual
+  const [csvNome, setCsvNome] = useState(null)          // arquivo CSV atual ou ultimo salvo
   const [backendOk, setBackendOk] = useState(false)     // WebSocket do backend vivo?
   const [eventos, setEventos] = useState([])            // marcas da torra atual
   const [visaoMotivo, setVisaoMotivo] = useState(null)  // motivo quando agtron_medido e null
   const [erroAcao, setErroAcao] = useState(null)        // falha de um botao
+
+  // Modais de iniciar / encerrar torra
+  const [modal, setModal] = useState(null)              // null | 'iniciar' | 'encerrar'
+  const [formNome, setFormNome] = useState('')
+  const [formNotas, setFormNotas] = useState('')
+
+  // Curva de referencia (ghost curve) a partir de um CSV salvo em torras/
+  const [torrasSalvas, setTorrasSalvas] = useState([])
+  const [refArquivo, setRefArquivo] = useState('')
+  const [refPontos, setRefPontos] = useState([])
 
   const tZeroRef = useRef(null) // instante da primeira leitura, vira o "0 s"
 
@@ -115,8 +132,11 @@ export default function App() {
   const paraPonto = useCallback((l) => {
     if (l?.temp == null || l?.recebido_em == null) return null
     if (tZeroRef.current === null) tZeroRef.current = l.recebido_em
+    const s = l.tempo_torra != null
+      ? Math.round(l.tempo_torra)
+      : Math.round(l.recebido_em - tZeroRef.current)
     return {
-      s: Math.round(l.recebido_em - tZeroRef.current), // segundos desde o inicio
+      s, // segundos desde o inicio da torra
       temp: Number(l.temp.toFixed(2)),
       agtron_estimado: l.agtron_estimado ?? null,
       agtron_medido: l.agtron_medido ?? null,
@@ -147,6 +167,9 @@ export default function App() {
         }
 
         setOffline(Boolean(msg.offline))
+        if ('em_torra' in msg) setEmTorra(Boolean(msg.em_torra))
+        if ('nome_torra' in msg) setNomeTorra(msg.nome_torra || null)
+        if ('csv_nome' in msg) setCsvNome(msg.csv_nome || null)
         if ('visao_motivo' in msg) setVisaoMotivo(msg.visao_motivo)
         if (Array.isArray(msg.eventos)) setEventos(msg.eventos)
 
@@ -170,13 +193,16 @@ export default function App() {
         // anterior e comecaria em "15:00" em vez de "0:00".
         if (Array.isArray(msg.historico)) {
           tZeroRef.current = null
-          if (msg.historico.length === 0) setLeitura(null)
+          if (msg.historico.length === 0 && msg.temp == null) setLeitura(null)
           setPontos(msg.historico.map(paraPonto).filter(Boolean).slice(-MAX_PONTOS))
           return
         }
 
-        const ponto = paraPonto(msg)
-        if (ponto) setPontos((atual) => [...atual, ponto].slice(-MAX_PONTOS))
+        // So acrescenta ponto na curva enquanto a torra estiver em andamento.
+        if (msg.em_torra) {
+          const ponto = paraPonto(msg)
+          if (ponto) setPontos((atual) => [...atual, ponto].slice(-MAX_PONTOS))
+        }
       }
 
       ws.onclose = () => {
@@ -195,19 +221,95 @@ export default function App() {
     }
   }, [paraPonto])
 
-  // ---- botoes: o backend confirma pelo WebSocket, nada muda aqui direto --
-  const acionar = useCallback(async (caminho) => {
-    setErroAcao(null)
+  // ---- lista de CSVs salvos para curva de referencia ---------------------
+  const carregarTorras = useCallback(async () => {
     try {
-      const r = await fetch(`${URL_HTTP}${caminho}`, { method: 'POST' })
-      if (!r.ok) setErroAcao((await r.json().catch(() => null))?.detail || `erro ${r.status}`)
+      const r = await fetch(`${URL_HTTP}/torras`)
+      if (!r.ok) return
+      const dados = await r.json()
+      if (Array.isArray(dados.torras)) setTorrasSalvas(dados.torras)
     } catch {
-      setErroAcao('backend não respondeu')
+      // backend indisponivel; tenta de novo ao reconectar
     }
   }, [])
 
-  const novaTorra = () => {
-    if (pontos.length && !window.confirm('Começar torra nova? A curva atual sai da tela (o CSV dela fica salvo).')) return
+  useEffect(() => {
+    if (backendOk) carregarTorras()
+  }, [backendOk, emTorra, carregarTorras])
+
+  useEffect(() => {
+    if (!refArquivo) {
+      setRefPontos([])
+      return
+    }
+    let ativo = true
+    fetch(`${URL_HTTP}/torras/${encodeURIComponent(refArquivo)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((dados) => {
+        if (ativo && Array.isArray(dados?.pontos)) setRefPontos(dados.pontos)
+      })
+      .catch(() => {
+        if (ativo) setRefPontos([])
+      })
+    return () => { ativo = false }
+  }, [refArquivo])
+
+  useEffect(() => {
+    if (!modal) return
+    const onKey = (e) => { if (e.key === 'Escape') setModal(null) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [modal])
+
+  // ---- botoes: o backend confirma pelo WebSocket, nada muda aqui direto --
+  const acionar = useCallback(async (caminho, corpo) => {
+    setErroAcao(null)
+    try {
+      const opcoes = { method: 'POST' }
+      if (corpo !== undefined) {
+        opcoes.headers = { 'Content-Type': 'application/json' }
+        opcoes.body = JSON.stringify(corpo)
+      }
+      const r = await fetch(`${URL_HTTP}${caminho}`, opcoes)
+      if (!r.ok) {
+        setErroAcao((await r.json().catch(() => null))?.detail || `erro ${r.status}`)
+        return false
+      }
+      return true
+    } catch {
+      setErroAcao('backend não respondeu')
+      return false
+    }
+  }, [])
+
+  const abrirModalIniciar = () => {
+    setFormNome('')
+    setFormNotas('')
+    setModal('iniciar')
+  }
+
+  const confirmarIniciar = async (e) => {
+    e.preventDefault()
+    const ok = await acionar('/torra/iniciar', { nome: formNome, notas: formNotas })
+    if (ok) setModal(null)
+  }
+
+  const abrirModalEncerrar = () => {
+    setFormNotas('')
+    setModal('encerrar')
+  }
+
+  const confirmarEncerrar = async (e) => {
+    e.preventDefault()
+    const ok = await acionar('/torra/encerrar', { notas: formNotas })
+    if (ok) {
+      setModal(null)
+      carregarTorras()
+    }
+  }
+
+  const limparCurva = () => {
+    if (!window.confirm('Limpar a curva da tela? O CSV dela já está salvo.')) return
     acionar('/sessao/nova')
   }
 
@@ -235,10 +337,16 @@ export default function App() {
     ? (desenvolvimento / fimTorra) * 100
     : null
 
-  // Depois da descarga a torra acabou: o RoR alto do resfriamento (ou de
-  // uma pipoqueira esquecida ligada) nao e mais problema da torra.
-  const rorAlto = ror != null && !descarga
+  // Depois da descarga ou do encerramento a torra acabou: o RoR alto do
+  // resfriamento (ou de uma pipoqueira esquecida ligada) nao e mais problema.
+  const rorAlto = emTorra && ror != null && !descarga
     && ultimo.s >= CARENCIA_ROR_S && ror > LIMITE_ROR
+
+  const estadoTorra = emTorra
+    ? 'gravando torra'
+    : pontos.length > 0
+      ? 'torra encerrada · CSV salvo'
+      : 'aguardando início'
 
   const temp = leitura?.temp
   const agtron = leitura?.agtron_estimado
@@ -253,7 +361,24 @@ export default function App() {
         <h1 className="titulo">Caderno de torra</h1>
         <p className="subtitulo">
           sessão local · backend <code>{BACKEND}</code>
+          {nomeTorra && <> · <strong>{nomeTorra}</strong></>}
+          {' · '}
+          <span className={`estado-torra${emTorra ? ' estado-torra--ativa' : ''}`}>{estadoTorra}</span>
           {pontos.length > 0 && ` · ${pontos.length} leituras`}
+          {!emTorra && csvNome && (
+            <>
+              {' · '}
+              <code>{csvNome}</code>
+              {' · '}
+              <a
+                className="link-csv"
+                href={`${URL_HTTP}/torras/${encodeURIComponent(csvNome)}/download`}
+                download={csvNome}
+              >
+                baixar CSV
+              </a>
+            </>
+          )}
         </p>
       </header>
 
@@ -363,7 +488,7 @@ export default function App() {
                     key={id}
                     type="button"
                     className={`botao${marcado ? ' marcado' : ''}`}
-                    disabled={!backendOk || pontos.length === 0}
+                    disabled={!backendOk || !emTorra || pontos.length === 0}
                     onClick={() => acionar(`/evento/${id}`)}
                   >
                     {texto}
@@ -376,9 +501,39 @@ export default function App() {
                 )
               })}
             </div>
-            <button type="button" className="botao botao--nova" disabled={!backendOk} onClick={novaTorra}>
-              nova torra
-            </button>
+            <div className="acoes-torra">
+              {emTorra ? (
+                <button
+                  type="button"
+                  className="botao botao--encerrar"
+                  disabled={!backendOk}
+                  onClick={abrirModalEncerrar}
+                >
+                  encerrar torra
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="botao botao--iniciar"
+                    disabled={!backendOk}
+                    onClick={abrirModalIniciar}
+                  >
+                    {pontos.length > 0 ? 'iniciar nova torra' : 'iniciar torra'}
+                  </button>
+                  {pontos.length > 0 && (
+                    <button
+                      type="button"
+                      className="botao botao--limpar"
+                      disabled={!backendOk}
+                      onClick={limparCurva}
+                    >
+                      limpar
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
             {erroAcao && <p className="erro-acao" role="alert">{erroAcao}</p>}
           </div>
         </section>
@@ -392,14 +547,38 @@ export default function App() {
                 RoR acima de {LIMITE_ROR} °C/min: subindo rápido demais
               </p>
             )}
-            <p className="legenda">
-              <span className="legenda-item legenda-item--temp">temperatura · °C</span>
-              <span className="legenda-item legenda-item--ror">RoR · °C/min, eixo da direita</span>
-            </p>
+            <div className="grafico-controles">
+              {torrasSalvas.length > 0 && (
+                <label className="ref-controle">
+                  <span>referência</span>
+                  <select
+                    className="seletor-ref"
+                    value={refArquivo}
+                    onChange={(e) => setRefArquivo(e.target.value)}
+                  >
+                    <option value="">nenhuma</option>
+                    {torrasSalvas.map((t) => (
+                      <option key={t.arquivo} value={t.arquivo}>
+                        {t.arquivo.replace(/^torra_/, '').replace(/\.csv$/, '')}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              <p className="legenda">
+                <span className="legenda-item legenda-item--temp">temperatura · °C</span>
+                <span className="legenda-item legenda-item--ror">RoR · °C/min, eixo da direita</span>
+                {refPontos.length > 0 && (
+                  <span className="legenda-item legenda-item--ref">referência · °C</span>
+                )}
+              </p>
+            </div>
           </div>
-          {pontos.length === 0 ? (
+          {pontos.length === 0 && refPontos.length === 0 ? (
             <div className="grafico-vazio">
-              aguardando a primeira leitura do T-Beam — a curva se desenha sozinha a partir daqui
+              {emTorra
+                ? 'torra iniciada — aguardando a primeira leitura do T-Beam'
+                : 'aguardando iniciar a torra — clique em "iniciar torra" para começar a gravar a curva e o CSV'}
             </div>
           ) : (
             <div className="grafico">
@@ -409,6 +588,7 @@ export default function App() {
                   <XAxis
                     dataKey="s"
                     type="number"
+                    allowDuplicatedCategory={false}
                     domain={['dataMin', 'dataMax']}
                     tickFormatter={relogio}
                     tick={{ fill: '#6e6259', fontSize: 12, fontFamily: 'Inter, sans-serif' }}
@@ -454,8 +634,24 @@ export default function App() {
                     label={{ value: `limite ${LIMITE_ROR}°/min`, position: 'insideBottomRight', fill: '#8a2e22', fontSize: 11 }}
                   />
                   <Tooltip content={<Dica />} cursor={{ stroke: '#d8cec0', strokeWidth: 1 }} />
+                  {refPontos.length > 0 && (
+                    <Line
+                      yAxisId="temp"
+                      data={refPontos}
+                      name="ref"
+                      type="monotone"
+                      dataKey="temp"
+                      stroke="#9e9184"
+                      strokeWidth={1.25}
+                      strokeDasharray="4 4"
+                      dot={false}
+                      isAnimationActive={false}
+                    />
+                  )}
                   <Line
                     yAxisId="temp"
+                    data={serie}
+                    name="temp"
                     type="monotone"
                     dataKey="temp"
                     stroke="#a9502f"
@@ -465,6 +661,8 @@ export default function App() {
                   />
                   <Line
                     yAxisId="ror"
+                    data={serie}
+                    name="ror"
                     type="monotone"
                     dataKey="ror"
                     stroke="#4f5b3c"
@@ -479,6 +677,80 @@ export default function App() {
           )}
         </section>
       </div>
+
+      {modal === 'iniciar' && (
+        <div className="modal-fundo" onClick={() => setModal(null)}>
+          <form className="modal" onSubmit={confirmarIniciar} onClick={(e) => e.stopPropagation()}>
+            <h3 className="modal-titulo">
+              {pontos.length > 0 ? 'Iniciar nova torra' : 'Iniciar torra'}
+            </h3>
+            {pontos.length > 0 && (
+              <p className="modal-aviso">
+                A curva atual sai da tela (o CSV dela já está salvo em <code>torras/</code>).
+              </p>
+            )}
+            <label className="modal-campo">
+              <span>Nome da torra (opcional)</span>
+              <input
+                type="text"
+                autoFocus
+                maxLength={80}
+                placeholder="ex.: Bourbon Amarelo · lote 1"
+                value={formNome}
+                onChange={(e) => setFormNome(e.target.value)}
+              />
+            </label>
+            <label className="modal-campo">
+              <span>Notas iniciais (opcional)</span>
+              <textarea
+                rows={3}
+                maxLength={2000}
+                placeholder="ex.: 100g café verde, pré-aquecido..."
+                value={formNotas}
+                onChange={(e) => setFormNotas(e.target.value)}
+              />
+            </label>
+            <div className="modal-acoes">
+              <button type="button" className="botao" onClick={() => setModal(null)}>
+                cancelar
+              </button>
+              <button type="submit" className="botao botao--iniciar">
+                começar a gravar
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {modal === 'encerrar' && (
+        <div className="modal-fundo" onClick={() => setModal(null)}>
+          <form className="modal" onSubmit={confirmarEncerrar} onClick={(e) => e.stopPropagation()}>
+            <h3 className="modal-titulo">Encerrar torra</h3>
+            <p className="modal-aviso">
+              O CSV será fechado e salvo, e a curva continuará visível na tela.
+            </p>
+            <label className="modal-campo">
+              <span>Observações finais (opcional)</span>
+              <textarea
+                rows={3}
+                autoFocus
+                maxLength={2000}
+                placeholder="ex.: cor uniforme, aroma doce, massa final..."
+                value={formNotas}
+                onChange={(e) => setFormNotas(e.target.value)}
+              />
+            </label>
+            <div className="modal-acoes">
+              <button type="button" className="botao" onClick={() => setModal(null)}>
+                voltar
+              </button>
+              <button type="submit" className="botao botao--encerrar">
+                encerrar e salvar CSV
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   )
 }

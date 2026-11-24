@@ -23,7 +23,7 @@ Automação experimental de um torrador de café de leito fluidizado (pipoqueira
 ```
 
 - **Sentido único:** o T-Beam é o **servidor** WebSocket (`ws://<ip>/ws`, mDNS `torrador.local`); quem abre a conexão é o backend. O frontend nunca acessa a placa diretamente.
-- **Persistência:** o backend mantém a sessão em memória e grava cada torra linha a linha em `torras/torra_YYYY-MM-DD_HHMMSS.csv`. Ao conectar, o navegador recebe imediatamente o retrato atual mais o `historico` completo.
+- **Persistência:** o backend inicia em modo de monitoramento (exibindo temperatura e visão ao vivo sem gravar). A gravação linha a linha em `torras/torra_YYYY-MM-DD_HHMMSS[_nome].csv` só começa ao clicar em **iniciar torra** (`POST /torra/iniciar`, com nome e notas opcionais) e fecha em **encerrar torra** (`POST /torra/encerrar`), mantendo a curva na tela. Ao conectar, o navegador recebe imediatamente o retrato atual mais o `historico` completo.
 - **Tipos de mensagem (`"tipo"`) e detecção de queda:**
   - `"leitura"`: dado novo do T-Beam (contém `temp` e `recebido_em`; único plotado no gráfico).
   - `"tick"`: aviso de estado (`offline`, `visao_motivo`) **sem** `temp` nem `recebido_em`, evitando pontos duplicados durante quedas.
@@ -48,6 +48,7 @@ Campos adicionados pelo backend na mensagem `"tipo": "leitura"`:
 | `agtron_medido` | Medição óptica da câmera (`visao/agtron.py`), ou `null` se indisponível/expirada (> 10 s) |
 | `visao_motivo` | Motivo quando `agtron_medido` é `null` (câmera desligada, sem modelo, mira estourada etc.) |
 | `offline` / `tbeam_uri` | Estado da conexão com a placa e URI alvo |
+| `em_torra` / `nome_torra` / `csv_nome` | Se há torra gravando, nome opcional do lote e nome do CSV ativo/salvo |
 | `eventos` | Marcas anotadas na sessão (`amarelamento`, `crack1`, `crack2`, `descarga`) com tempo e temperatura |
 
 ---
@@ -143,10 +144,15 @@ TBEAM_HOST=127.0.0.1 TBEAM_PORT=8080 uvicorn main:app --reload --port 8000
 
 | Rota | Descrição |
 |---|---|
-| `GET /status` | Diagnóstico completo (conexão, socket, CSV ativo, eventos, estado da visão e última leitura) |
-| `GET /historico` | Todas as leituras da sessão atual |
-| `POST /sessao/nova` | Fecha o CSV atual em `torras/`, zera cronômetro/memória e inicia nova torra |
-| `POST /evento/{nome}` | Registra `amarelamento`, `crack1`, `crack2` ou `descarga` no gráfico e no CSV |
+| `GET /status` | Diagnóstico completo (conexão, estado da torra, socket, CSV ativo, eventos, visão e última leitura) |
+| `GET /historico` | Todas as leituras da torra atual |
+| `POST /torra/iniciar` | Inicia uma nova torra (aceita JSON opcional `{"nome", "notas"}`), zera cronômetro/memória e passa a gravar CSV |
+| `POST /torra/encerrar` | Encerra a torra atual, fecha o CSV, salva `_notas.md` (se houver nome/notas) e mantém a curva na tela |
+| `POST /sessao/nova` | Fecha qualquer CSV aberto, limpa a curva da tela e volta ao modo de espera |
+| `POST /evento/{nome}` | Registra `amarelamento`, `crack1`, `crack2` ou `descarga` no gráfico e no CSV (apenas com torra em andamento) |
+| `GET /torras` | Lista os CSVs salvos em `torras/` (usado no seletor de curva de referência) |
+| `GET /torras/{arquivo}` | Retorna os pontos de um CSV salvo para sobrepor como curva de referência (*ghost curve*) |
+| `GET /torras/{arquivo}/download` | Faz o download direto do CSV salvo |
 | `WS /ws/temperatura` | Canal WebSocket consumido pelo frontend |
 
 ### 3. Frontend (React + Vite) e Verificação
@@ -158,7 +164,7 @@ npm install && npm run dev   # abre em http://localhost:5173 (ajuste VITE_BACKEN
 
 No painel **"Caderno de torra"**:
 - **Status da cadeia:** verde (`cadeia completa`), laranja (`T-Beam desconectado` — reconectando a cada 3 s) ou vermelho (`backend fora do ar`). Pelo terminal: `curl localhost:8000/status`.
-- **Métricas e alertas:** temperatura com régua térmica, **RoR (°C/min)** calculado em janela de 30 s (com alerta acima de `40 °C/min` após 60 s de torra), **tempo de desenvolvimento e DTR (%)** pós-1º crack, e botões de anotação de eventos.
+- **Métricas e alertas:** temperatura com régua térmica, **RoR (°C/min)** calculado em janela de 15 s (com alerta acima de `40 °C/min` após 30 s de torra), **tempo de desenvolvimento e DTR (%)** pós-1º crack, e botões de anotação de eventos.
 
 ---
 

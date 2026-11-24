@@ -23,7 +23,7 @@ Experimental automation of a fluidized-bed coffee roaster (hot-air popcorn poppe
 ```
 
 - **One-way data flow:** the T-Beam is the WebSocket **server** (`ws://<ip>/ws`, mDNS `torrador.local`); the backend initiates the connection. The frontend never talks directly to the board.
-- **Persistence:** the backend keeps the current session in memory and writes each roast line-by-line to `torras/torra_YYYY-MM-DD_HHMMSS.csv`. Upon connecting, the browser immediately receives the current snapshot plus the full session `historico`.
+- **Persistence:** the backend starts in standby/monitoring mode (streaming live temperature and vision without logging). Line-by-line recording to `torras/torra_YYYY-MM-DD_HHMMSS[_name].csv` only starts when clicking **iniciar torra** (`POST /torra/iniciar`, with optional name and notes) and stops on **encerrar torra** (`POST /torra/encerrar`), keeping the finished curve visible on screen. Upon connecting, the browser immediately receives the current snapshot plus the full session `historico`.
 - **Message types (`"tipo"`) and disconnect detection:**
   - `"leitura"`: new reading from the T-Beam (carries `temp` and `recebido_em`; the only type plotted on the chart).
   - `"tick"`: connection status notice (`offline`, `visao_motivo`) **without** `temp` or `recebido_em`, preventing duplicate chart points during outages.
@@ -48,6 +48,7 @@ Fields added by the backend on `"tipo": "leitura"` messages:
 | `agtron_medido` | Optical measurement from the camera (`visao/agtron.py`), or `null` if unavailable/stale (> 10 s) |
 | `visao_motivo` | Reason string when `agtron_medido` is `null` (camera disabled, missing model, overexposed ROI, etc.) |
 | `offline` / `tbeam_uri` | Board connection state and target WebSocket URI |
+| `em_torra` / `nome_torra` / `csv_nome` | Whether a roast is actively recording, optional batch name, and active/saved CSV filename |
 | `eventos` | Session event markers (`amarelamento`, `crack1`, `crack2`, `descarga`) with roast time and temperature |
 
 ---
@@ -143,10 +144,15 @@ TBEAM_HOST=127.0.0.1 TBEAM_PORT=8080 uvicorn main:app --reload --port 8000
 
 | Route | Description |
 |---|---|
-| `GET /status` | Full diagnostics (connection, socket, active CSV, events, vision state, and latest reading) |
-| `GET /historico` | Complete reading history for the current session |
-| `POST /sessao/nova` | Closes the current CSV in `torras/`, resets timer/memory, and starts a new roast |
-| `POST /evento/{nome}` | Marks `amarelamento`, `crack1`, `crack2`, or `descarga` on the chart and in the CSV |
+| `GET /status` | Full diagnostics (connection, roast state, socket, active CSV, events, vision state, and latest reading) |
+| `GET /historico` | Complete reading history for the current roast |
+| `POST /torra/iniciar` | Starts a new roast (optional JSON `{"nome", "notas"}`), resets timer/memory, and begins CSV logging |
+| `POST /torra/encerrar` | Ends the current roast, closes the CSV, writes `_notas.md` (if named/annotated), and keeps the curve on screen |
+| `POST /sessao/nova` | Closes any open CSV, clears the chart, and returns to standby mode |
+| `POST /evento/{nome}` | Marks `amarelamento`, `crack1`, `crack2`, or `descarga` on the chart and in the CSV (only while roasting) |
+| `GET /torras` | Lists saved CSVs in `torras/` (used by the reference curve selector) |
+| `GET /torras/{arquivo}` | Returns parsed points from a saved CSV to overlay as a reference (ghost) curve |
+| `GET /torras/{arquivo}/download` | Downloads a saved CSV file directly from the browser |
 | `WS /ws/temperatura` | WebSocket stream consumed by the frontend |
 
 ### 3. Frontend (React + Vite) & Verification
@@ -158,7 +164,7 @@ npm install && npm run dev   # opens at http://localhost:5173 (set VITE_BACKEND_
 
 In the **"Caderno de torra"** dashboard:
 - **Chain status:** green (`cadeia completa`), orange (`T-Beam desconectado` — retrying every 3 s), or red (`backend fora do ar`). CLI check: `curl localhost:8000/status`.
-- **Metrics & alerts:** live temperature with thermal ruler, **RoR (°C/min)** computed over a 30 s rolling window (with high-RoR alert above `40 °C/min` after 60 s of roast), **development time and DTR (%)** after 1st crack, and event annotation buttons.
+- **Metrics & alerts:** live temperature with thermal ruler, **RoR (°C/min)** computed over a 15 s rolling window (with high-RoR alert above `40 °C/min` after 30 s of roast), **development time and DTR (%)** after 1st crack, and event annotation buttons.
 
 ---
 

@@ -152,6 +152,18 @@ body {
   color: var(--ink);
 }
 
+.estado-torra--ativa {
+  color: var(--oliva);
+  font-weight: 500;
+}
+
+.link-csv {
+  color: var(--terracota);
+  text-decoration: none;
+  border-bottom: 1px solid currentColor;
+}
+.link-csv:hover { opacity: 0.8; }
+
 /* ==========================================================================
  *  Status da cadeia
  * ========================================================================== */
@@ -365,7 +377,36 @@ body {
   color: var(--ink-suave);
   font-variant-numeric: tabular-nums;
 }
-.botao--nova { width: 100%; text-align: center; }
+.acoes-torra {
+  display: flex;
+  gap: var(--e2);
+}
+.botao--iniciar,
+.botao--encerrar {
+  flex: 1;
+  text-align: center;
+  font-weight: 500;
+}
+.botao--iniciar {
+  border-color: var(--oliva);
+  color: var(--oliva);
+}
+.botao--iniciar:hover:not(:disabled) {
+  border-color: var(--oliva);
+  background: rgba(79, 91, 60, 0.08);
+}
+.botao--encerrar {
+  border-color: var(--oxblood);
+  color: var(--oxblood);
+}
+.botao--encerrar:hover:not(:disabled) {
+  border-color: var(--oxblood);
+  background: rgba(138, 46, 34, 0.08);
+}
+.botao--limpar {
+  text-align: center;
+  color: var(--ink-suave);
+}
 
 .erro-acao {
   margin: var(--e2) 0 0;
@@ -413,6 +454,29 @@ body {
   justify-content: space-between;
   gap: var(--e2) var(--e4);
 }
+.grafico-controles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--e2) var(--e4);
+}
+.ref-controle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--e2);
+  font-size: 0.8125rem;
+  color: var(--ink-suave);
+}
+.seletor-ref {
+  font: inherit;
+  font-size: 0.8125rem;
+  color: var(--ink);
+  background: var(--papel);
+  border: 1px solid var(--linha-forte);
+  border-radius: 5px;
+  padding: 3px 8px;
+  max-width: 240px;
+}
 .legenda {
   display: flex;
   flex-wrap: wrap;
@@ -431,6 +495,79 @@ body {
 }
 .legenda-item--temp::before { background: var(--terracota); }
 .legenda-item--ror::before { background: var(--oliva); }
+.legenda-item--ref::before {
+  background: transparent;
+  border-top: 2px dashed #9e9184;
+  height: 0;
+}
+
+/* --- modais de iniciar / encerrar torra ---------------------------------- */
+.modal-fundo {
+  position: fixed;
+  inset: 0;
+  background: rgba(46, 38, 33, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--e4);
+  z-index: 20;
+}
+.modal {
+  width: 100%;
+  max-width: 420px;
+  background: var(--papel);
+  border: 1px solid var(--linha-forte);
+  border-radius: 8px;
+  padding: var(--e4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--e3);
+}
+.modal-titulo {
+  margin: 0;
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: 1.25rem;
+  color: var(--ink);
+}
+.modal-aviso {
+  margin: 0;
+  font-size: 0.875rem;
+  color: var(--ink-suave);
+}
+.modal-campo {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.8125rem;
+  color: var(--ink-suave);
+}
+.modal-campo input,
+.modal-campo textarea {
+  font: inherit;
+  font-size: 0.9375rem;
+  color: var(--ink);
+  background: var(--papel);
+  border: 1px solid var(--linha-forte);
+  border-radius: 6px;
+  padding: 8px 10px;
+  resize: vertical;
+}
+.modal-campo input:focus,
+.modal-campo textarea:focus {
+  outline: none;
+  border-color: var(--terracota);
+}
+.modal-acoes {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--e2);
+  margin-top: var(--e1);
+}
+.modal-acoes .botao {
+  flex: 0 1 auto;
+  text-align: center;
+}
 
 .dica {
   background: var(--ink);
