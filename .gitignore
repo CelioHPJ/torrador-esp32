@@ -26,3 +26,7 @@ firmware/include/credenciais.h
 # capturados, insubstituiveis, e permitem reprocessar com outra mira sem
 # refotografar as amostras.
 calibracao/dados/preview.png
+
+# Estado da torra em andamento (retomada apos reinicio do backend)
+torras/.torra_ativa.json
+torras/.torra_ativa.json.tmp

@@ -112,6 +112,7 @@ export default function App() {
   const [eventos, setEventos] = useState([])            // marcas da torra atual
   const [visaoMotivo, setVisaoMotivo] = useState(null)  // motivo quando agtron_medido e null
   const [erroAcao, setErroAcao] = useState(null)        // falha de um botao
+  const [enviando, setEnviando] = useState(false)       // requisicao de um modal em andamento
 
   // Modais de iniciar / encerrar torra
   const [modal, setModal] = useState(null)              // null | 'iniciar' | 'encerrar'
@@ -288,9 +289,14 @@ export default function App() {
     setModal('iniciar')
   }
 
+  // enviando trava o botao do modal ate o backend responder: sem isso, um
+  // clique duplo mandava dois POSTs e o segundo voltava 409 na tela.
   const confirmarIniciar = async (e) => {
     e.preventDefault()
+    if (enviando) return
+    setEnviando(true)
     const ok = await acionar('/torra/iniciar', { nome: formNome, notas: formNotas })
+    setEnviando(false)
     if (ok) setModal(null)
   }
 
@@ -301,7 +307,10 @@ export default function App() {
 
   const confirmarEncerrar = async (e) => {
     e.preventDefault()
+    if (enviando) return
+    setEnviando(true)
     const ok = await acionar('/torra/encerrar', { notas: formNotas })
+    setEnviando(false)
     if (ok) {
       setModal(null)
       carregarTorras()
@@ -349,7 +358,12 @@ export default function App() {
       : 'aguardando início'
 
   const temp = leitura?.temp
-  const agtron = leitura?.agtron_estimado
+  // Durante a torra, o Agtron vem ao vivo. Depois de encerrar, mostra o valor
+  // FINAL da torra (ultimo ponto da curva), rotulado como tal, para nao
+  // parecer leitura atual ao lado da temperatura que segue ao vivo.
+  const agtronFinal = !emTorra && pontos.length > 0
+  const agtron = emTorra ? leitura?.agtron_estimado : (ultimo?.agtron_estimado ?? null)
+  const sufixoAgtron = agtronFinal ? ' · final da torra' : ''
   const agtronMedido = leitura?.agtron_medido
   const preenchimento = temp == null
     ? 0
@@ -416,7 +430,7 @@ export default function App() {
             {agtronMedido != null ? (
               <div className="agtron-grade">
                 <div>
-                  <span className="rotulo">Agtron estimado · térmico</span>
+                  <span className="rotulo">Agtron estimado · térmico{sufixoAgtron}</span>
                   <div
                     className={`valor-medio${agtron == null ? ' vazio' : ''}${
                       offline && agtron != null ? ' parado' : ''
@@ -436,7 +450,7 @@ export default function App() {
               </div>
             ) : (
               <>
-                <span className="rotulo">Agtron estimado</span>
+                <span className="rotulo">Agtron estimado{sufixoAgtron}</span>
                 <div
                   className={`valor-medio${agtron == null ? ' vazio' : ''}${
                     offline && agtron != null ? ' parado' : ''
@@ -714,8 +728,8 @@ export default function App() {
               <button type="button" className="botao" onClick={() => setModal(null)}>
                 cancelar
               </button>
-              <button type="submit" className="botao botao--iniciar">
-                começar a gravar
+              <button type="submit" className="botao botao--iniciar" disabled={enviando}>
+                {enviando ? 'iniciando…' : 'começar a gravar'}
               </button>
             </div>
           </form>
@@ -744,8 +758,8 @@ export default function App() {
               <button type="button" className="botao" onClick={() => setModal(null)}>
                 voltar
               </button>
-              <button type="submit" className="botao botao--encerrar">
-                encerrar e salvar CSV
+              <button type="submit" className="botao botao--encerrar" disabled={enviando}>
+                {enviando ? 'encerrando…' : 'encerrar e salvar CSV'}
               </button>
             </div>
           </form>

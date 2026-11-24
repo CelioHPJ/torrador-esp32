@@ -89,6 +89,15 @@ TORRAS_DIR = os.getenv("TORRADOR_TORRAS_DIR", os.path.join(RAIZ_REPO, "torras"))
 COLUNAS_CSV = ["tempo_torra_s", "temp_c", "hora", "agtron_estimado",
                "agtron_medido", "evento"]
 
+# Torra em andamento persistida em disco. O em_torra vive na memoria; sem este
+# arquivo, um reinicio do backend no meio da torra (crash, ou o --reload do
+# uvicorn ao salvar um .py) voltava ao modo de espera e parava de gravar sem
+# avisar ninguem. Com ele, o backend retoma a mesma torra no mesmo CSV.
+ARQUIVO_TORRA_ATIVA = os.path.join(TORRAS_DIR, ".torra_ativa.json")
+# Torra "ativa" mais velha que isto nao e retomada: e uma torra que alguem
+# esqueceu de encerrar antes de desligar tudo, nao uma queda no meio dela.
+VALIDADE_TORRA_ATIVA_S = 3600.0
+
 # Eventos que o painel pode marcar. Lista fechada para os CSVs de torras
 # diferentes continuarem comparaveis.
 EVENTOS_VALIDOS = {
@@ -261,6 +270,8 @@ class Estado:
         self.nome_torra: Optional[str] = None
         self.notas_torra: str = ""
         self.ultimo_csv_nome: Optional[str] = None
+        # Epoch do clique em "iniciar torra" (vai para o _notas.md).
+        self.iniciada_em: Optional[float] = None
         # Menor Agtron ja atingido na sessao (ver processar_leitura).
         self.agtron_estimado: Optional[float] = None
         # Relogio MONOTONICO da ultima leitura valida aceita - ou do instante
@@ -331,7 +342,8 @@ def salvar_notas_torra(caminho_csv: Optional[str]) -> Optional[str]:
     linhas = [
         f"# {titulo}",
         "",
-        f"- **Data:** {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+        f"- **Início:** {datetime.fromtimestamp(estado.iniciada_em or time.time()).strftime('%d/%m/%Y %H:%M')}",
+        f"- **Fim:** {datetime.now().strftime('%d/%m/%Y %H:%M')}",
         f"- **CSV:** `{os.path.basename(caminho_csv)}`",
     ]
     if estado.eventos:
@@ -388,6 +400,121 @@ def fechar_csv() -> None:
     estado.arquivo_csv = None
     estado.escritor_csv = None
     estado.caminho_csv = None
+
+
+def salvar_torra_ativa() -> None:
+    """Grava em disco o necessario para retomar a torra apos um reinicio."""
+    dados = {
+        "nome": estado.nome_torra,
+        "notas": estado.notas_torra,
+        "iniciada_em": estado.iniciada_em,
+        "inicio_torra": estado.inicio_torra,
+        "caminho_csv": estado.caminho_csv,
+    }
+    try:
+        os.makedirs(TORRAS_DIR, exist_ok=True)
+        temporario = ARQUIVO_TORRA_ATIVA + ".tmp"
+        with open(temporario, "w", encoding="utf-8") as f:
+            json.dump(dados, f)
+        os.replace(temporario, ARQUIVO_TORRA_ATIVA)  # atomico: nunca meio escrito
+    except OSError as erro:
+        log.warning("Nao consegui salvar o estado da torra ativa: %s", erro)
+
+
+def apagar_torra_ativa() -> None:
+    try:
+        os.remove(ARQUIVO_TORRA_ATIVA)
+    except FileNotFoundError:
+        pass
+    except OSError as erro:
+        log.warning("Nao consegui apagar o estado da torra ativa: %s", erro)
+
+
+def _float_ou_none(valor: Any) -> Optional[float]:
+    try:
+        numero = float(valor)
+    except (TypeError, ValueError):
+        return None
+    return numero if math.isfinite(numero) else None
+
+
+def restaurar_torra_ativa() -> None:
+    """Retoma uma torra que estava em andamento quando o backend caiu.
+
+    Reabre o mesmo CSV em modo de acrescimo e reconstroi historico e eventos a
+    partir dele, para a curva voltar inteira na tela. As leituras do periodo
+    em que o backend ficou fora se perdem (vira um buraco na curva), mas o
+    cronometro continua certo: inicio_torra e relogio de parede.
+    """
+    try:
+        with open(ARQUIVO_TORRA_ATIVA, encoding="utf-8") as f:
+            dados = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as erro:
+        log.warning("Estado da torra ativa ilegivel, ignorado: %s", erro)
+        apagar_torra_ativa()
+        return
+    if not isinstance(dados, dict):
+        apagar_torra_ativa()
+        return
+
+    referencia = _float_ou_none(dados.get("inicio_torra")) or _float_ou_none(dados.get("iniciada_em"))
+    if referencia is None or time.time() - referencia > VALIDADE_TORRA_ATIVA_S:
+        log.warning("Torra ativa antiga ou sem horario no disco; nao sera retomada")
+        apagar_torra_ativa()
+        return
+
+    estado.em_torra = True
+    estado.nome_torra = dados.get("nome") or None
+    estado.notas_torra = dados.get("notas") or ""
+    estado.iniciada_em = _float_ou_none(dados.get("iniciada_em"))
+    estado.inicio_torra = _float_ou_none(dados.get("inicio_torra"))
+
+    caminho = dados.get("caminho_csv")
+    if caminho and os.path.isfile(caminho) and estado.inicio_torra is not None:
+        try:
+            with open(caminho, encoding="utf-8", newline="") as f:
+                for row in csv.DictReader(f):
+                    tempo = _float_ou_none(row.get("tempo_torra_s"))
+                    temp = _float_ou_none(row.get("temp_c"))
+                    if tempo is None or temp is None:
+                        continue
+                    evento = (row.get("evento") or "").strip()
+                    if evento:
+                        estado.eventos.append({
+                            "evento": evento,
+                            "rotulo": EVENTOS_VALIDOS.get(evento, evento),
+                            "tempo_torra": tempo,
+                            "temp": temp,
+                        })
+                        continue
+                    estimado = _float_ou_none(row.get("agtron_estimado"))
+                    estado.historico.append({
+                        "temp": temp,
+                        "timestamp": None,
+                        "recebido_em": estado.inicio_torra + tempo,
+                        "tempo_torra": tempo,
+                        "agtron_estimado": estimado,
+                        "agtron_medido": _float_ou_none(row.get("agtron_medido")),
+                    })
+                    if estimado is not None:
+                        estado.agtron_estimado = (
+                            estimado if estado.agtron_estimado is None
+                            else min(estado.agtron_estimado, estimado)
+                        )
+            estado.caminho_csv = caminho
+            estado.ultimo_csv_nome = os.path.basename(caminho)
+            estado.arquivo_csv = open(caminho, "a", newline="", encoding="utf-8")
+            estado.escritor_csv = csv.DictWriter(estado.arquivo_csv, fieldnames=COLUNAS_CSV)
+        except OSError as erro:
+            log.warning("Nao consegui reabrir o CSV da torra ativa: %s", erro)
+
+    log.warning(
+        "Torra em andamento RETOMADA apos reinicio do backend (%s, %d leituras recuperadas)",
+        estado.caminho_csv or "CSV ainda nao criado",
+        len(estado.historico),
+    )
 
 
 def montar_mensagem() -> dict[str, Any]:
@@ -583,7 +710,8 @@ async def processar_leitura(bruta: str) -> None:
 
     if estado.em_torra:
         # ---- estimativa de Agtron ---------------------------------------
-        if estado.inicio_torra is None:
+        primeira_leitura = estado.inicio_torra is None
+        if primeira_leitura:
             estado.inicio_torra = leitura["recebido_em"]
         tempo_decorrido = leitura["recebido_em"] - estado.inicio_torra
 
@@ -609,10 +737,15 @@ async def processar_leitura(bruta: str) -> None:
             "agtron_estimado": agtron_val,
             "agtron_medido": "" if medido is None else medido,
         })
+        if primeira_leitura:
+            # Agora ha CHARGE e CSV: e o que um reinicio precisa para retomar.
+            salvar_torra_ativa()
     else:
         # Fora de torra: atualiza a leitura ao vivo na tela (temperatura e
-        # camera), sem gravar CSV nem acrescentar pontos na curva.
-        leitura["agtron_estimado"] = estado.agtron_estimado
+        # camera), sem gravar CSV nem acrescentar pontos na curva. Sem Agtron
+        # estimado: ele so existe dentro de uma torra, e repetir aqui o valor
+        # final da torra anterior faria ele parecer leitura atual.
+        leitura["agtron_estimado"] = None
         leitura["tempo_torra"] = None
         estado.ultima_leitura = leitura
 
@@ -783,6 +916,7 @@ async def vigia_dado_parado() -> None:
 # --------------------------------------------------------------------------
 @asynccontextmanager
 async def ciclo_de_vida(app: FastAPI):
+    restaurar_torra_ativa()
     tarefas = [
         asyncio.create_task(ponte_tbeam(), name="ponte_tbeam"),
         asyncio.create_task(vigia_dado_parado(), name="vigia_dado_parado"),
@@ -877,9 +1011,11 @@ async def iniciar_torra(
     estado.nome_torra = nome or None
     estado.notas_torra = notas
     estado.ultimo_csv_nome = None
+    estado.iniciada_em = time.time()
     estado.em_torra = True
     if agtron is not None:
         agtron.resetar_suavizacao()
+    salvar_torra_ativa()
 
     await enviar_para_todos({**montar_mensagem(), "historico": []})
 
@@ -912,6 +1048,7 @@ async def encerrar_torra(
     csv_nome = os.path.basename(arquivo_encerrado) if arquivo_encerrado else None
     estado.em_torra = False
     fechar_csv()
+    apagar_torra_ativa()
     notas_salvas = salvar_notas_torra(arquivo_encerrado)
     if csv_nome:
         estado.ultimo_csv_nome = csv_nome
@@ -937,6 +1074,7 @@ async def sessao_nova() -> dict[str, Any]:
     arquivo_anterior = estado.caminho_csv
     estado.em_torra = False
     fechar_csv()
+    apagar_torra_ativa()
 
     estado.historico = []
     estado.eventos = []
@@ -945,6 +1083,7 @@ async def sessao_nova() -> dict[str, Any]:
     estado.nome_torra = None
     estado.notas_torra = ""
     estado.ultimo_csv_nome = None
+    estado.iniciada_em = None
     if agtron is not None:
         agtron.resetar_suavizacao()
 
