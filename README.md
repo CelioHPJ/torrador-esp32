@@ -8,7 +8,7 @@ Automação experimental de um torrador de café de leito fluidizado (pipoqueira
 
 - **Telemetria térmica:** termopar tipo K via **MAX31855** em uma **LilyGO T-Beam (ESP32)**, com sonda no meio dos grãos (4 amostras/s a cada 250 ms + filtro de picos).
 - **Visão computacional (`visao/` e `calibracao/`):** captura com exposição e balanço de branco travados, conversão para **CIELAB** ($L^*, a^*, b^*$) e regressão linear (`scikit-learn`) para medir o índice **Agtron** em tempo real.
-- **Painel web ("Caderno de torra"):** backend **FastAPI** + frontend **React** exibindo curva térmica, **RoR** (°C/min), tempo de desenvolvimento (**DTR**), marcação de eventos, gravação automática em CSV (`torras/`) e Agtron.
+- **Painel web ("Caderno de torra"):** backend **FastAPI** + frontend **React** exibindo curva térmica, **RoR** (°C/min), tempo de desenvolvimento (**DTR**), marcação de eventos, gravação em CSV (`torras/`) controlada pelos botões **iniciar torra** / **encerrar torra** e Agtron.
 
 > **Estado atual:** telemetria validada ponta a ponta em torras reais (`torras/`). Na primeira torra (`06/10/2026`), o **1º crack** foi marcado em **1:24 (158,7 °C)** e a **descarga** em **2:54 (224,2 °C, pico ~225 °C)** com Wi-Fi estável. O laço de visão já está integrado ao backend, aguardando a fixação da câmera e calibração (`visao/modelo_agtron.pkl`).
 

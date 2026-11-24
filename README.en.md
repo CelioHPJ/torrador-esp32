@@ -8,7 +8,7 @@ Experimental automation of a fluidized-bed coffee roaster (hot-air popcorn poppe
 
 - **Real-time thermal telemetry:** Type-K thermocouple via **MAX31855** on a **LilyGO T-Beam (ESP32)** board, with the probe placed inside the roasting chamber amidst the beans (4 samples/s every 250 ms + spike filter).
 - **Computer vision (`visao/` & `calibracao/`):** camera capture with locked exposure and white balance, conversion to the **CIELAB** ($L^*, a^*, b^*$) color space, and supervised linear regression (`scikit-learn`) to measure the **Agtron** roast index in real time.
-- **Web dashboard ("Caderno de torra"):** **FastAPI** backend + **React** frontend displaying the roast temperature curve, **RoR** (*Rate of Rise*, °C/min), development time (**DTR**), event markers, automatic CSV logging (`torras/`), and Agtron index.
+- **Web dashboard ("Caderno de torra"):** **FastAPI** backend + **React** frontend displaying the roast temperature curve, **RoR** (*Rate of Rise*, °C/min), development time (**DTR**), event markers, CSV logging (`torras/`) controlled by the **iniciar torra** / **encerrar torra** buttons, and Agtron index.
 
 > **Current status:** end-to-end thermal telemetry validated in real roasts (`torras/`). In the first real roast (`2026-10-06`), **1st crack** was marked at **1:24 (158.7 °C)** and **drop/discharge** at **2:54 (224.2 °C, peak ~225 °C)** with stable Wi-Fi throughout. The vision loop is integrated into the backend, awaiting physical camera mounting and calibration (`visao/modelo_agtron.pkl`).
 
